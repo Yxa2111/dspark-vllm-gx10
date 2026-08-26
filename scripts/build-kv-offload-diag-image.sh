@@ -6,7 +6,13 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 base_image="${BASE_IMAGE:-ghcr.io/anemll/dspark-vllm-gx10:0.1.1@sha256:a83948492cf13df455170fb42885f5ef4db54fefe0feff0f841ecbff464ac9d8}"
 final_image="${FINAL_IMAGE:-dspark-vllm-gx10:kv-offload-diag-phase0}"
 
-sudo docker build \
+if docker info >/dev/null 2>&1; then
+  docker_cmd=(docker)
+else
+  docker_cmd=(sudo docker)
+fi
+
+"${docker_cmd[@]}" build \
   --file "$root/docker/Dockerfile.kv-offload-diag" \
   --build-arg "VLLM_BASE=$base_image" \
   --tag "$final_image" \
