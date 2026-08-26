@@ -1,0 +1,181 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
+index 29914e738..2fd8b3839 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
+@@ -26,6 +26,7 @@ from vllm.v1.kv_offload.base import (
+     OffloadingSpec,
+     OffloadingWorker,
+ )
++from vllm.v1.kv_offload.diag import emit_kv_offload_diag
+ 
+ logger = init_logger(__name__)
+ 
+@@ -62,6 +63,30 @@ class OffloadingConnectorWorker:
+             for kv_tensor in kv_cache_config.kv_cache_tensors
+             for ln in kv_tensor.shared_by
+         }
++        emit_kv_offload_diag(
++            "worker.register.begin",
++            num_blocks=num_blocks,
++            parallel_rank=self.spec.vllm_config.parallel_config.rank,
++            world_size=self.spec.vllm_config.parallel_config.world_size,
++            kv_cache_tensors=[
++                {
++                    "size": tensor_config.size,
++                    "block_stride": tensor_config.block_stride,
++                    "shared_by": list(tensor_config.shared_by),
++                }
++                for tensor_config in kv_cache_config.kv_cache_tensors
++            ],
++            kv_cache_groups=[
++                {
++                    "block_size": getattr(group.kv_cache_spec, "block_size", None),
++                    "page_size_bytes": getattr(
++                        group.kv_cache_spec, "page_size_bytes", None
++                    ),
++                    "layer_count": len(group.layer_names),
++                }
++                for group in kv_cache_config.kv_cache_groups
++            ],
++        )
+ 
+         # layer_name -> (num_blocks, page_size_bytes) tensor
+         tensors_per_block: dict[str, tuple[torch.Tensor, ...]] = {}
+@@ -104,6 +129,28 @@ class OffloadingConnectorWorker:
+                             (block_stride_bytes, 1),
+                         ),
+                     )
++                    storage_nbytes = layer_kv_cache.untyped_storage().nbytes()
++                    view_end_bytes = (
++                        byte_offset
++                        + max(num_blocks - 1, 0) * block_stride_bytes
++                        + page
++                    )
++                    emit_kv_offload_diag(
++                        "worker.register.attention_layer",
++                        layer_name=layer_name,
++                        packed=layer_is_packed[layer_name],
++                        dtype=str(layer_kv_cache.dtype),
++                        shape=list(layer_kv_cache.shape),
++                        stride=list(layer_kv_cache.stride()),
++                        storage_offset_elements=layer_kv_cache.storage_offset(),
++                        byte_offset=byte_offset,
++                        storage_nbytes=storage_nbytes,
++                        page_size_bytes=page,
++                        real_page_size_bytes=layer_kv_cache_spec.real_page_size_bytes,
++                        block_stride_bytes=block_stride_bytes,
++                        view_end_bytes=view_end_bytes,
++                        bounds_ok=view_end_bytes <= storage_nbytes,
++                    )
+                     page_size_bytes[layer_name] = layer_kv_cache_spec.page_size_bytes
+                     unpadded_page_size_bytes[layer_name] = (
+                         layer_kv_cache_spec.real_page_size_bytes
+@@ -153,6 +200,21 @@ class OffloadingConnectorWorker:
+                 (block_stride, 1),
+                 storage_offset=0,
+             )
++            packed_span_bytes = (
++                max(num_blocks - 1, 0) * block_stride
++                + (block_stride if num_blocks else 0)
++            )
++            emit_kv_offload_diag(
++                "worker.register.packed_canonical",
++                source_layer=packed_kv_cache_tensor.shared_by[0],
++                num_blocks=num_blocks,
++                block_stride_bytes=block_stride,
++                storage_nbytes=tensor.untyped_storage().nbytes(),
++                packed_span_bytes=packed_span_bytes,
++                bounds_ok=packed_span_bytes <= tensor.untyped_storage().nbytes(),
++                canonical_tensor_count=1,
++                canonical_group_count=len(kv_cache_config.kv_cache_groups),
++            )
+             self._init_worker(
+                 CanonicalKVCaches(
+                     [CanonicalKVCacheTensor(packed_tensor, block_stride)],
+diff --git a/vllm/v1/kv_offload/cpu/spec.py b/vllm/v1/kv_offload/cpu/spec.py
+index 16729a9db..0e7f951de 100644
+--- a/vllm/v1/kv_offload/cpu/spec.py
++++ b/vllm/v1/kv_offload/cpu/spec.py
+@@ -20,6 +20,7 @@ from vllm.v1.kv_offload.base import (
+ from vllm.v1.kv_offload.cpu.common import CPUOffloadingMetrics
+ from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
+ from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
++from vllm.v1.kv_offload.diag import emit_kv_offload_diag
+ 
+ 
+ class CPUOffloadingSpec(OffloadingSpec):
+@@ -97,6 +98,23 @@ class CPUOffloadingSpec(OffloadingSpec):
+             # |--- W0-B0---|---- W1-B0---| ... |---- Wn-B0---| *** maybe-pad *** |
+             self.kv_bytes_per_offloaded_block = aligned_kv_bytes_per_offloaded_block
+ 
++            emit_kv_offload_diag(
++                "cpu_spec.sizing",
++                parallel_rank=vllm_config.parallel_config.rank,
++                world_size=world_size,
++                is_packed=is_packed,
++                gpu_num_blocks=kv_cache_config.num_blocks,
++                total_gpu_kv_bytes=total_gpu_kv_bytes,
++                kv_bytes_per_block_all_workers=kv_bytes_per_block,
++                block_size_factor=self.block_size_factor,
++                cpu_page_size_per_worker=self.cpu_page_size_per_worker,
++                aligned_kv_bytes_per_offloaded_block=(
++                    self.kv_bytes_per_offloaded_block
++                ),
++                cpu_bytes_to_use=int(cpu_bytes_to_use),
++                cpu_num_blocks=self.num_blocks,
++            )
++
+         # scheduler-side
+         self._manager: OffloadingManager | None = None
+ 
+diff --git a/vllm/v1/kv_offload/file_mapper.py b/vllm/v1/kv_offload/file_mapper.py
+index d8fadb099..1ce3ab8bd 100644
+--- a/vllm/v1/kv_offload/file_mapper.py
++++ b/vllm/v1/kv_offload/file_mapper.py
+@@ -11,6 +11,7 @@ from vllm.v1.kv_offload.base import (
+     get_offload_block_hash,
+     get_offload_group_idx,
+ )
++from vllm.v1.kv_offload.diag import emit_kv_offload_diag
+ 
+ _BASE_PATH_HASH_LEN = 12
+ _CONFIG_FILENAME = "config.json"
+@@ -60,6 +61,15 @@ class FileMapper:
+             "inference_engine": inference_engine,
+         }
+         self.base_path: str = self._compute_base_path(root_dir, self.fields)
++        self._diag_keys_seen = 0
++        emit_kv_offload_diag(
++            "file_mapper.init",
++            root_dir=root_dir,
++            base_path=self.base_path,
++            rank=self.rank,
++            fields=self.fields,
++            parallel_agnostic=parallel_agnostic,
++        )
+ 
+     @classmethod
+     def from_offloading_spec(
+@@ -114,10 +124,21 @@ class FileMapper:
+         hash_hex = get_offload_block_hash(key).hex()
+         group_idx = get_offload_group_idx(key)
+         subfolder1, subfolder2 = hash_hex[:3], hash_hex[3:5]
+-        return (
++        file_name = (
+             f"{self.base_path}_r{self.rank}"
+             f"/{subfolder1}/{subfolder2}_g{group_idx}/{hash_hex}.bin"
+         )
++        if self._diag_keys_seen < 8:
++            emit_kv_offload_diag(
++                "file_mapper.key",
++                sample_index=self._diag_keys_seen,
++                rank=self.rank,
++                group_idx=group_idx,
++                hash_prefix=hash_hex[:16],
++                file_name=file_name,
++            )
++            self._diag_keys_seen += 1
++        return file_name
+ 
+     def get_run_config(self) -> dict:
+         return dict(self.fields)

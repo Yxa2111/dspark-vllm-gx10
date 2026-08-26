@@ -20,6 +20,14 @@ git -C "$source_dir" reset --hard "$VLLM_COMMIT"
 git -C "$source_dir" clean -fdx
 rsync -a "$root/overlay/vllm/" "$source_dir/vllm/"
 
+shopt -s nullglob
+vllm_patches=("$root"/patches/vllm/*.patch)
+for patch in "${vllm_patches[@]}"; do
+  echo "Applying $(basename "$patch")"
+  git -C "$source_dir" apply --check "$patch"
+  git -C "$source_dir" apply "$patch"
+done
+
 # vLLM 0.25 keeps its primary Dockerfile under docker/, not at repository root.
 # Permit an override for future upstream layout changes, but fail clearly instead
 # of letting Docker report a misleading missing-root-Dockerfile error.

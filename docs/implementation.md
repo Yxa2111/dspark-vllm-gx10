@@ -74,3 +74,45 @@ All upstream revisions are pinned in `upstream.lock` so a build cannot silently
 move to incompatible wrapper or kernel behavior. In particular, b12x is pinned
 to Git commit `7dc6fb8f`; its package reports `0.15.3`, but that version was not
 published to PyPI.
+
+## Experimental packed-KV offload diagnostics
+
+The `experiment/packed-kv-offload-tp2` line keeps the pinned vLLM revision and
+applies a small patch series after the normal overlay. The first patch is
+diagnostic-only: it does not change transfer geometry, hashing, or scheduling.
+
+Set `DSPARK_KV_OFFLOAD_DIAG=1` to emit structured
+`DSPARK_KV_OFFLOAD_DIAG` records for:
+
+- configured KV groups, block sizes, packed tensor sizes, and `block_stride`;
+- each attention view's byte offset, stride, storage size, and bounds result;
+- the whole-packed canonical view selected by `OffloadingConnectorWorker`;
+- CPU staging/offloaded-block sizing and the scheduler's parallel rank;
+- filesystem mapper rank/base path plus the first eight key mappings.
+
+The records contain metadata and hash prefixes only. They never inspect prompt
+tokens or KV contents. The switch defaults to `0`, so the production path pays
+only the module import and disabled function calls.
+
+Validate the patch stack against the exact commit in `upstream.lock` before an
+image build:
+
+```bash
+./scripts/check-vllm-patches.sh
+```
+
+For Phase 0, a thin image applies the same checked patch to the immutable 0.1.1
+runtime without recompiling CUDA extensions:
+
+```bash
+FINAL_IMAGE=dspark-vllm-gx10:kv-offload-diag-phase0 \
+  ./scripts/build-kv-offload-diag-image.sh
+```
+
+Build that tag independently on both ARM64 nodes from the same commit. This is
+an instrumentation shortcut only; layout-changing fixes must use the complete
+source build.
+
+This Phase 0 evidence decides whether the existing whole-packed path is
+self-consistent on both TP ranks. Per-group transfer geometry is not introduced
+until those invariants and an actual store/restart/load trace show it is needed.

@@ -98,7 +98,8 @@ ghcr.io/anemll/dspark-vllm-gx10:0.1.1
 ```
 
 To reproduce it locally, run `./scripts/build-image.sh`. The script checks out
-the exact vLLM commit in `upstream.lock`, applies `overlay/`, builds the vLLM
+the exact vLLM commit in `upstream.lock`, applies `overlay/` and the ordered
+`patches/vllm/*.patch` series, then builds the vLLM
 ARM64 image, and installs pinned FlashInfer and b12x Git revisions. The b12x
 pin is intentionally a Git commit: the tested `0.15.3` source was not released
 on PyPI.
