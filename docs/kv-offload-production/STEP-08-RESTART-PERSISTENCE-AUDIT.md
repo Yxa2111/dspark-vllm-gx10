@@ -2,9 +2,9 @@
 
 Date: 2026-08-27
 
-State: design audit complete.  This document is the acceptance contract for
-the next implementation commit; it does not claim that restart persistence is
-already implemented.
+State: design audit complete.  This document is the acceptance contract;
+implementation and offline evidence are recorded in
+[`STEP-09-PERSISTENT-INDEX-IMPLEMENTATION.md`](STEP-09-PERSISTENT-INDEX-IMPLEMENTATION.md).
 
 ## Goal
 
