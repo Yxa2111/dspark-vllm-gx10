@@ -3,23 +3,27 @@ ARG VLLM_BASE=ghcr.io/anemll/dspark-vllm-gx10:0.1.1@sha256:a83948492cf13df455170
 FROM ${VLLM_BASE}
 
 LABEL org.opencontainers.image.source="https://github.com/Yxa2111/dspark-vllm-gx10"
-LABEL org.opencontainers.image.description="Packed-KV offload diagnostics and DSpark veto-exempt PoC"
+LABEL org.opencontainers.image.description="Packed-KV offload diagnostics and DSpark ephemeral-group contract"
 
 COPY overlay/vllm/v1/kv_offload/diag.py \
   /usr/local/lib/python3.12/dist-packages/vllm/v1/kv_offload/diag.py
 COPY patches/vllm/0001-kv-offload-layout-diag.patch /tmp/kv-offload-layout-diag.patch
 COPY patches/vllm/0002-kv-offload-fs-lookup-diag.patch /tmp/kv-offload-fs-lookup-diag.patch
-COPY patches/vllm/0003-kv-offload-dspark-veto-exempt.patch /tmp/kv-offload-dspark-veto-exempt.patch
+COPY patches/vllm/0003-kv-offload-dspark-ephemeral-contract.patch /tmp/kv-offload-dspark-ephemeral-contract.patch
 
 RUN cd /usr/local/lib/python3.12/dist-packages && \
     patch --batch --forward --dry-run -p1 < /tmp/kv-offload-layout-diag.patch && \
     patch --batch --forward -p1 < /tmp/kv-offload-layout-diag.patch && \
     patch --batch --forward --dry-run -p1 < /tmp/kv-offload-fs-lookup-diag.patch && \
     patch --batch --forward -p1 < /tmp/kv-offload-fs-lookup-diag.patch && \
-    patch --batch --forward --dry-run -p1 < /tmp/kv-offload-dspark-veto-exempt.patch && \
-    patch --batch --forward -p1 < /tmp/kv-offload-dspark-veto-exempt.patch && \
+    patch --batch --forward --dry-run -p1 < /tmp/kv-offload-dspark-ephemeral-contract.patch && \
+    patch --batch --forward -p1 < /tmp/kv-offload-dspark-ephemeral-contract.patch && \
     python3 -m py_compile \
+      vllm/config/speculative.py \
       vllm/v1/kv_offload/diag.py \
+      vllm/v1/kv_cache_interface.py \
+      vllm/v1/core/kv_cache_utils.py \
+      vllm/v1/core/kv_cache_coordinator.py \
       vllm/v1/kv_offload/cpu/spec.py \
       vllm/v1/kv_offload/file_mapper.py \
       vllm/v1/kv_offload/tiering/fs/manager.py \
@@ -27,4 +31,4 @@ RUN cd /usr/local/lib/python3.12/dist-packages && \
       vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py && \
     rm -f /tmp/kv-offload-layout-diag.patch \
       /tmp/kv-offload-fs-lookup-diag.patch \
-      /tmp/kv-offload-dspark-veto-exempt.patch
+      /tmp/kv-offload-dspark-ephemeral-contract.patch

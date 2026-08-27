@@ -1,0 +1,271 @@
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index 2e0126368..443ddbdd2 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -1247,6 +1247,19 @@ class SpeculativeConfig:
+     def use_dspark(self) -> bool:
+         return self.method == "dspark"
+
++    def has_ephemeral_draft_context(self) -> bool:
++        """Whether the draft KV is rebuilt from target hidden states.
++
++        Unlike EAGLE/EAGLE3/MTP, DSpark's draft context is per-round scratch
++        state and has no request-independent prefix-cache meaning. A miss in
++        that group therefore cannot authoritatively veto stable target-model
++        groups during multi-group cache-hit convergence.
++
++        DFlash has a similar architecture but is intentionally excluded until
++        it has independent end-to-end coverage on this runtime.
++        """
++        return self.method == "dspark"
++
+     def uses_dynamic_speculative_decoding(self) -> bool:
+         return self.num_speculative_tokens_per_batch_size is not None
+
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+index 284098ce9..bbac7854f 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -90,6 +90,9 @@ class GroupOffloadConfig(NamedTuple):
+     # of these groups is volatile and lacks a stable hash, so it must
+     # be excluded from store and load scheduling.
+     is_eagle_group: bool = False
++    # Mirrors KVCacheGroupSpec.eagle_group_is_veto_exempt. A zero hit from an
++    # ephemeral draft-context group cannot veto stable target-model groups.
++    eagle_group_is_veto_exempt: bool = False
+
+
+ def get_sliding_window_size_in_blocks(
+@@ -173,6 +176,11 @@ class SchedulerOffloadConfig(NamedTuple):
+             for idx, g in enumerate(spec.kv_cache_config.kv_cache_groups)
+             if g.is_eagle_group
+         }
++        veto_exempt_groups = {
++            idx
++            for idx, g in enumerate(spec.kv_cache_config.kv_cache_groups)
++            if g.is_eagle_group and g.eagle_group_is_veto_exempt
++        }
+
+         use_eagle = (
+             spec.vllm_config.speculative_config is not None
+@@ -213,6 +221,7 @@ class SchedulerOffloadConfig(NamedTuple):
+                         spec.kv_cache_config.kv_cache_groups[idx]
+                     ),
+                     is_eagle_group=idx in eagle_groups,
++                    eagle_group_is_veto_exempt=idx in veto_exempt_groups,
+                 )
+                 for idx, gpu_block_size in enumerate(spec.gpu_block_size)
+             ),
+@@ -246,6 +255,9 @@ class RequestOffloadState:
+     # In-flight job IDs. Per the connector's invariant, at any given time
+     # this contains either a single load job, or one or more store jobs.
+     transfer_jobs: set[int] = field(default_factory=set)
++    # Groups dropped from the latest successful lookup because their
++    # ephemeral draft KV reported no reusable prefix.
++    lookup_excluded_groups: frozenset[int] = field(default_factory=frozenset)
+
+     def __post_init__(self) -> None:
+         self.group_states = tuple(
+@@ -491,6 +503,8 @@ class OffloadingConnectorScheduler:
+         # in the current convergence iteration. Reset when a non-eagle group
+         # tightens the hit boundary, requiring a fresh pop.
+         eagle_verified: set[int] = set()
++        excluded_groups: set[int] = set()
++        req_status.lookup_excluded_groups = frozenset()
+         while lookup_groups:
+             looked_up_sliding_window: bool = False
+             groups_iter = iter(lookup_groups)
+@@ -556,6 +570,11 @@ class OffloadingConnectorScheduler:
+                         req_status.req_context,
+                     )
+                 if num_hit_blocks == 0:
++                    if group_config.is_eagle_group and (
++                        group_config.eagle_group_is_veto_exempt
++                    ):
++                        excluded_groups.add(group_idx)
++                        continue
+                     return 0
+
+                 if num_hit_blocks is None:
+@@ -582,15 +601,25 @@ class OffloadingConnectorScheduler:
+                         # make another iteration on all groups to check
+                         # if we still need to defer lookup
+                         defer_lookup = False
+-                        lookup_groups = self._lookup_groups
++                        lookup_groups = tuple(
++                            group_idx
++                            for group_idx in self._lookup_groups
++                            if group_idx not in excluded_groups
++                        )
+                     elif looked_up_sliding_window and not lookup_groups:
+                         # we need another iteration to confirm previously looked up
+                         # sliding window works with the new_num_hit_tokens
+-                        lookup_groups = self._sliding_window_groups
++                        lookup_groups = tuple(
++                            group_idx
++                            for group_idx in self._sliding_window_groups
++                            if group_idx not in excluded_groups
++                        )
+
+                 looked_up_sliding_window |= sliding_window_size_in_blocks is not None
+                 num_hit_tokens = new_num_hit_tokens
+
++        req_status.lookup_excluded_groups = frozenset(excluded_groups)
++
+         if defer_lookup:
+             logger.debug(
+                 "Offloading manager delayed request %s as backend requested",
+@@ -603,6 +632,8 @@ class OffloadingConnectorScheduler:
+             for group_config, group_state in zip(
+                 self.config.kv_group_configs, req_status.group_states
+             ):
++                if group_config.group_idx in excluded_groups:
++                    continue
+                 offloaded_block_size = group_config.offloaded_block_size
+                 sliding_window_size_in_blocks = (
+                     group_config.sliding_window_size_in_blocks
+@@ -717,6 +748,11 @@ class OffloadingConnectorScheduler:
+                 block.block_id for block in group_blocks if block.block_id != 0
+             )
+
++            if group_config.group_idx in req_status.lookup_excluded_groups:
++                group_sizes.append(0)
++                block_indices.append(0)
++                continue
++
+             gpu_block_size = group_config.gpu_block_size
+             offloaded_block_size = group_config.offloaded_block_size
+             offload_keys = group_state.offload_keys
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index a759d7a80..c09bada37 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -100,6 +100,14 @@ class KVCacheCoordinator(ABC):
+         self.eagle_group_ids: set[int] = {
+             i for i, g in enumerate(kv_cache_config.kv_cache_groups) if g.is_eagle_group
+         }
++        # Keep this empty when the fallback below flags every group: without
++        # an explicit annotation we cannot safely infer which group is
++        # ephemeral.
++        self.veto_exempt_eagle_group_ids: set[int] = {
++            i
++            for i, g in enumerate(kv_cache_config.kv_cache_groups)
++            if g.is_eagle_group and g.eagle_group_is_veto_exempt
++        }
+         # Conservatively fall back to flag all groups when no group is flagged.
+         if use_eagle and not self.eagle_group_ids:
+             self.eagle_group_ids = set(range(len(kv_cache_config.kv_cache_groups)))
+@@ -509,6 +517,9 @@ class SpecGroup(NamedTuple):
+     group_ids: list[int]
+     manager_cls: type[SingleTypeKVCacheManager]
+     use_eagle: bool
++    # Conservative AND when identical specs merge: a shared manager may ignore
++    # a zero hit only when every member group declares the exemption.
++    veto_exempt: bool = False
+
+
+ class HybridKVCacheCoordinator(KVCacheCoordinator):
+@@ -567,6 +578,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+             manager_cls = self.single_type_managers[i].__class__
+             spec = g.kv_cache_spec
+             use_eagle = i in self.eagle_group_ids
++            veto_exempt = i in self.veto_exempt_eagle_group_ids
+
+             # Try to find an existing group with the same spec
+             for idx, group in enumerate(self.attention_groups):
+@@ -575,12 +587,20 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+                         "Expected same manager class for identical KV cache specs."
+                     )
+                     group.group_ids.append(i)
+-                    if use_eagle and not group.use_eagle:
+-                        self.attention_groups[idx] = group._replace(use_eagle=True)
++                    new_use_eagle = group.use_eagle or use_eagle
++                    new_veto_exempt = group.veto_exempt and veto_exempt
++                    if (
++                        new_use_eagle != group.use_eagle
++                        or new_veto_exempt != group.veto_exempt
++                    ):
++                        self.attention_groups[idx] = group._replace(
++                            use_eagle=new_use_eagle,
++                            veto_exempt=new_veto_exempt,
++                        )
+                     break
+             else:
+                 self.attention_groups.append(
+-                    SpecGroup(spec, [i], manager_cls, use_eagle)
++                    SpecGroup(spec, [i], manager_cls, use_eagle, veto_exempt)
+                 )
+
+         assert len(self.attention_groups) > 1, (
+@@ -676,8 +696,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+         while True:
+             curr_hit_length = hit_length
+
+-            for idx, (spec, group_ids, manager_cls, use_eagle) in enumerate(
+-                self.attention_groups
++            for idx, (spec, group_ids, manager_cls, use_eagle, veto_exempt) in (
++                enumerate(self.attention_groups)
+             ):
+                 cached_blocks = hit_blocks_by_group[group_ids[0]]
+                 if isinstance(spec, FullAttentionSpec) and cached_blocks is not None:
+@@ -707,6 +727,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+                     alignment_tokens=self.scheduler_block_size,
+                 )
+                 _new_hit_length = len(hit_blocks[0]) * spec.block_size
++                if veto_exempt and _new_hit_length == 0:
++                    # DSpark rebuilds this scratch context after stable target
++                    # KV is restored. Its miss says nothing about the target
++                    # groups' independently confirmed prefix.
++                    continue
+                 if drop_eagle_block:
+                     eagle_verified.add(idx)
+                 elif _new_hit_length < curr_hit_length:
+@@ -761,7 +786,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+         hit_blocks: list[list[KVCacheBlock]] = [[] for _ in range(num_groups)]
+         hit_lengths: list[int] = [0] * num_groups
+
+-        for spec, group_ids, manager_cls, use_eagle in self.attention_groups:
++        for spec, group_ids, manager_cls, use_eagle, _veto_exempt in (
++            self.attention_groups
++        ):
+             blocks = manager_cls.find_longest_cache_hit(
+                 block_hashes=_get_block_hashes(spec),
+                 max_length=max_cache_hit_length,
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index b13c23d80..cd5a32ab9 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -1691,6 +1691,9 @@ def _annotate_eagle_groups_deepseek_v4(
+     for group in kv_cache_groups:
+         if last_layer in group.layer_names:
+             group.is_eagle_group = True
++            group.eagle_group_is_veto_exempt = (
++                spec_config.has_ephemeral_draft_context()
++            )
+             break
+
+
+@@ -1997,6 +2000,8 @@ def _project_kv_cache_groups_to_worker(
+                 worker_layer_names,
+                 group_spec,
+                 is_eagle_group=group.is_eagle_group and bool(worker_layer_names),
++                eagle_group_is_veto_exempt=group.eagle_group_is_veto_exempt
++                and bool(worker_layer_names),
+             )
+         )
+     return projected_groups
+diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
+index e19f23d15..c46cc6dc1 100644
+--- a/vllm/v1/kv_cache_interface.py
++++ b/vllm/v1/kv_cache_interface.py
+@@ -918,6 +918,10 @@ class KVCacheGroupSpec:
+     kv_cache_spec: KVCacheSpec
+     # Whether this group contains EAGLE/MTP draft attention layers.
+     is_eagle_group: bool = False
++    # Only meaningful for an explicitly annotated EAGLE-family group. A zero
++    # hit from an ephemeral draft-context group is not authoritative and must
++    # not veto independently confirmed stable target-model groups.
++    eagle_group_is_veto_exempt: bool = False
+
+
+ @dataclass

@@ -35,10 +35,15 @@ for patch in "${vllm_patches[@]}"; do
 done
 
 python3 -m py_compile \
+  "$tmp_dir/vllm/vllm/config/speculative.py" \
+  "$tmp_dir/vllm/vllm/v1/kv_cache_interface.py" \
+  "$tmp_dir/vllm/vllm/v1/core/kv_cache_utils.py" \
+  "$tmp_dir/vllm/vllm/v1/core/kv_cache_coordinator.py" \
   "$tmp_dir/vllm/vllm/v1/kv_offload/diag.py" \
   "$tmp_dir/vllm/vllm/v1/kv_offload/cpu/spec.py" \
   "$tmp_dir/vllm/vllm/v1/kv_offload/file_mapper.py" \
   "$tmp_dir/vllm/vllm/v1/kv_offload/tiering/fs/manager.py" \
-  "$tmp_dir/vllm/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py"
+  "$tmp_dir/vllm/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py" \
+  "$tmp_dir/vllm/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py"
 
 echo "Validated ${#vllm_patches[@]} patch(es) against $VLLM_COMMIT"
