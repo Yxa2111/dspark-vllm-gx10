@@ -1,0 +1,422 @@
+diff --git a/tests/v1/simple_kv_offload/test_disk_backend.py b/tests/v1/simple_kv_offload/test_disk_backend.py
+index e98620691..7b6916da0 100644
+--- a/tests/v1/simple_kv_offload/test_disk_backend.py
++++ b/tests/v1/simple_kv_offload/test_disk_backend.py
+@@ -5,6 +5,7 @@
+ from __future__ import annotations
+ 
+ import os
++import queue
+ from types import SimpleNamespace
+ 
+ import pytest
+@@ -117,3 +118,36 @@ def test_batch_copy_uses_independent_row_strides(monkeypatch) -> None:
+     assert params.src_strides.tolist() == [3]
+     assert params.dst_strides.tolist() == [5]
+     assert params.copy_sizes.tolist() == [3]
++
++
++def test_full_io_queue_fails_closed_after_bounded_wait() -> None:
++    backend = DiskBackend()
++    backend._store_queue = queue.Queue(maxsize=1)
++    backend._enqueue_timeout_s = 0.001
++    backend._store_queue.put_nowait(object())
++
++    with pytest.raises(RuntimeError, match="store queue remained full.*depth=1"):
++        backend.launch_copy(
++            [1],
++            [2],
++            is_store=True,
++            event_idx=3,
++            events_list=[],
++        )
++
++
++def test_shutdown_replaces_queued_work_with_one_sentinel() -> None:
++    backend = DiskBackend()
++    backend._store_queue = queue.Queue(maxsize=2)
++    backend._load_queue = queue.Queue(maxsize=2)
++    backend._store_queue.put_nowait(object())
++    backend._load_queue.put_nowait(object())
++
++    backend.shutdown()
++
++    assert backend._store_queue.get_nowait() is None
++    assert backend._load_queue.get_nowait() is None
++    with pytest.raises(queue.Empty):
++        backend._store_queue.get_nowait()
++    with pytest.raises(RuntimeError, match="backend is shut down"):
++        backend.launch_copy([1], [2], True, 3, [])
+diff --git a/tests/v1/simple_kv_offload/test_scheduler.py b/tests/v1/simple_kv_offload/test_scheduler.py
+index 0e31b8932..fa55ea4a7 100644
+--- a/tests/v1/simple_kv_offload/test_scheduler.py
++++ b/tests/v1/simple_kv_offload/test_scheduler.py
+@@ -4,6 +4,7 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ from dataclasses import dataclass
+ 
+ import pytest
+@@ -104,7 +105,7 @@ def _make_kv_cache_config(
+ def _make_vllm_config(block_size: int = BLOCK_SIZE) -> VllmConfig:
+     """Minimal VllmConfig for scheduler tests (no GPU)."""
+     model_config = ModelConfig(
+-        model="facebook/opt-125m",
++        model=os.environ.get("VLLM_TEST_MODEL", "facebook/opt-125m"),
+         trust_remote_code=True,
+         dtype="float16",
+         seed=42,
+@@ -150,6 +151,7 @@ def make_scheduler(
+     num_gpu_blocks: int = 16,
+     num_groups: int = 1,
+     lazy: bool = False,
++    max_store_blocks_per_event: int = 0,
+ ) -> SchedulerFixture:
+     """Build a SimpleCPUOffloadScheduler with small block pools."""
+     kv_cache_config = _make_kv_cache_config(num_gpu_blocks, num_groups)
+@@ -163,6 +165,7 @@ def make_scheduler(
+         scheduler_block_size=BLOCK_SIZE,
+         hash_block_size=BLOCK_SIZE,
+         lazy_offload=lazy,
++        max_store_blocks_per_event=max_store_blocks_per_event,
+     )
+ 
+     # Build a real GPU block pool and bind it
+@@ -324,6 +327,36 @@ def test_disk_capacity_accounts_for_direct_io_padding() -> None:
+         )
+ 
+ 
++def test_eager_store_event_block_count_is_bounded_and_resumable() -> None:
++    fix = make_scheduler(
++        num_cpu_blocks=8,
++        num_gpu_blocks=16,
++        lazy=False,
++        max_store_blocks_per_event=2,
++    )
++    sched = fix.scheduler
++    req = make_request(num_blocks=4)
++    kv_blocks = _alloc_and_register(fix, req, 4)
++    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
++
++    first = sched.build_connector_meta(
++        make_scheduler_output(
++            {req.request_id: 4 * BLOCK_SIZE},
++            new_reqs={req.request_id: kv_blocks.get_block_ids()},
++        )
++    )
++    assert len(first.store_gpu_blocks) == 2
++    simulate_store_completion(sched, first.store_event)
++
++    second = sched.build_connector_meta(
++        make_scheduler_output(
++            {req.request_id: 1},
++            cached_req_new_blocks={req.request_id: None},
++        )
++    )
++    assert len(second.store_gpu_blocks) == 2
++
++
+ def _allocate_gpu_blocks(
+     gpu_block_pool: BlockPool,
+     request: Request,
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
+index 5be1eefe2..50b65b008 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """SimpleCPUOffloadConnector: minimal CPU KV cache offloading."""
+ 
++import os
+ from collections.abc import Iterable
+ from typing import TYPE_CHECKING, Any
+ 
+@@ -49,6 +50,9 @@ _DISK_ONLY_KEYS = (
+     "disk_buffer_slots",
+     "use_page_cache",
+     "preallocate_disk",
++    "disk_queue_depth",
++    "disk_enqueue_timeout_s",
++    "disk_max_store_blocks",
+ )
+ 
+ 
+@@ -98,15 +102,40 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
+         disk_capacity_bytes = int(
+             extra_config.get("disk_capacity_bytes", 100 * (1024**3))
+         )
+-        disk_buffer_slots = max(1, int(extra_config.get("disk_buffer_slots", 2)))
+-        use_page_cache = bool(extra_config.get("use_page_cache", False))
+-        preallocate_disk = bool(extra_config.get("preallocate_disk", True))
++        disk_buffer_slots = int(extra_config.get("disk_buffer_slots", 2))
++        use_page_cache = extra_config.get("use_page_cache", False)
++        preallocate_disk = extra_config.get("preallocate_disk", True)
++        disk_queue_depth = int(extra_config.get("disk_queue_depth", 2))
++        disk_enqueue_timeout_s = float(
++            extra_config.get("disk_enqueue_timeout_s", 30.0)
++        )
++        disk_max_store_blocks = int(extra_config.get("disk_max_store_blocks", 64))
+ 
+         if disk_mode:
+-            if disk_path is None:
++            if not isinstance(disk_path, str) or not disk_path:
+                 raise ValueError(
+                     'kv_offload_backend="disk" requires disk_path to be set.'
+                 )
++            if not os.path.isabs(disk_path):
++                raise ValueError("disk_path must be absolute")
++            if disk_capacity_bytes <= 0:
++                raise ValueError("disk_capacity_bytes must be positive")
++            if not 1 <= disk_buffer_slots <= 8:
++                raise ValueError("disk_buffer_slots must be between 1 and 8")
++            if not isinstance(use_page_cache, bool):
++                raise ValueError("use_page_cache must be a boolean")
++            if not isinstance(preallocate_disk, bool):
++                raise ValueError("preallocate_disk must be a boolean")
++            if not 1 <= disk_queue_depth <= 64:
++                raise ValueError("disk_queue_depth must be between 1 and 64")
++            if not 0 < disk_enqueue_timeout_s <= 300:
++                raise ValueError(
++                    "disk_enqueue_timeout_s must be greater than 0 and at most 300"
++                )
++            if not 1 <= disk_max_store_blocks <= 4096:
++                raise ValueError(
++                    "disk_max_store_blocks must be between 1 and 4096"
++                )
+         else:
+             ignored = [k for k in _DISK_ONLY_KEYS if k in extra_config]
+             if ignored:
+@@ -153,6 +182,9 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
+                 hash_block_size=hash_block_size,
+                 lazy_offload=lazy_offload,
+                 disk_capacity_bytes=disk_capacity_bytes if disk_mode else 0,
++                max_store_blocks_per_event=(
++                    disk_max_store_blocks if disk_mode else 0
++                ),
+             )
+         elif role == KVConnectorRole.WORKER:
+             self.worker_handler = SimpleCPUOffloadWorker(
+@@ -165,6 +197,8 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
+                 disk_buffer_slots=disk_buffer_slots,
+                 use_page_cache=use_page_cache,
+                 preallocate_disk=preallocate_disk,
++                disk_queue_depth=disk_queue_depth,
++                disk_enqueue_timeout_s=disk_enqueue_timeout_s,
+             )
+ 
+     # --- Worker-side methods ---
+diff --git a/vllm/v1/simple_kv_offload/disk_backend.py b/vllm/v1/simple_kv_offload/disk_backend.py
+index 56aa8569d..2eefa4dfb 100644
+--- a/vllm/v1/simple_kv_offload/disk_backend.py
++++ b/vllm/v1/simple_kv_offload/disk_backend.py
+@@ -70,8 +70,9 @@ class DiskBackend:
+         self._load_params: BatchMemcpyParams | None = None
+         self._load_stream: torch.cuda.Stream | None = None
+         self._store_stream: torch.cuda.Stream | None = None
+-        self._store_queue: queue.SimpleQueue = queue.SimpleQueue()
+-        self._load_queue: queue.SimpleQueue = queue.SimpleQueue()
++        self._store_queue: queue.Queue = queue.Queue(maxsize=1)
++        self._load_queue: queue.Queue = queue.Queue(maxsize=1)
++        self._enqueue_timeout_s: float = 30.0
+         self._store_thread: threading.Thread | None = None
+         self._load_thread: threading.Thread | None = None
+         self._shutdown: bool = False
+@@ -103,11 +104,20 @@ class DiskBackend:
+         num_buffer_slots: int = 2,
+         use_page_cache: bool = False,
+         preallocate_disk: bool = True,
++        queue_depth: int = 2,
++        enqueue_timeout_s: float = 30.0,
+     ) -> None:
+         self._load_stream = load_stream
+         self._store_stream = store_stream
+         self._total_block_bytes = total_block_bytes
+         self._num_buffer_slots = num_buffer_slots
++        if queue_depth < 1:
++            raise ValueError("queue_depth must be positive")
++        if enqueue_timeout_s <= 0:
++            raise ValueError("enqueue_timeout_s must be positive")
++        self._store_queue = queue.Queue(maxsize=queue_depth)
++        self._load_queue = queue.Queue(maxsize=queue_depth)
++        self._enqueue_timeout_s = enqueue_timeout_s
+         self._tensor_names = list(gpu_caches.keys())
+         self._per_tensor_bpb = [
+             t.stride(0) * t.element_size() for t in gpu_caches.values()
+@@ -183,13 +193,15 @@ class DiskBackend:
+         logger.info(
+             "DiskBackend: path=%s, slots=%d, total=%.2f GB, "
+             "payload=%d slot=%d bytes, buf=%d"
+-            " (page_cache=%s)",
++            " queue=%d timeout=%.1fs (page_cache=%s)",
+             disk_path,
+             num_disk_slots,
+             (num_disk_slots * self._disk_slot_bytes) / (1024**3),
+             total_block_bytes,
+             self._disk_slot_bytes,
+             num_buffer_slots,
++            queue_depth,
++            enqueue_timeout_s,
+             use_page_cache,
+         )
+ 
+@@ -233,10 +245,32 @@ class DiskBackend:
+         wait_event: torch.Event | None = None,
+     ) -> None:
+         self.raise_if_failed()
++        if self._shutdown:
++            raise RuntimeError("KV disk backend is shut down")
+         if len(src_blocks) != len(dst_blocks):
+             raise ValueError("source and destination block counts differ")
+         q = self._store_queue if is_store else self._load_queue
+-        q.put((src_blocks, dst_blocks, event_idx, events_list, wait_event))
++        operation = "store" if is_store else "load"
++        try:
++            q.put(
++                (src_blocks, dst_blocks, event_idx, events_list, wait_event),
++                timeout=self._enqueue_timeout_s,
++            )
++        except queue.Full as error:
++            raise RuntimeError(
++                f"KV disk {operation} queue remained full for "
++                f"{self._enqueue_timeout_s:.1f}s (depth={q.maxsize})"
++            ) from error
++
++    @staticmethod
++    def _replace_pending_with_stop(q: queue.Queue) -> None:
++        """Drop queued process-lifetime work and install one stop sentinel."""
++        while True:
++            try:
++                q.get_nowait()
++            except queue.Empty:
++                break
++        q.put_nowait(None)
+ 
+     def _record_failure(
+         self, operation: str, event_idx: int, error: BaseException
+@@ -272,8 +306,11 @@ class DiskBackend:
+         if self._shutdown:
+             return
+         self._shutdown = True
+-        self._store_queue.put(None)
+-        self._load_queue.put(None)
++        # Do not block shutdown behind a full queue. In-flight work may finish,
++        # but queued process-lifetime cache writes/loads have no consumer once
++        # the engine is stopping and are safe to discard.
++        self._replace_pending_with_stop(self._store_queue)
++        self._replace_pending_with_stop(self._load_queue)
+         if self._store_thread is not None:
+             self._store_thread.join(timeout=10.0)
+         if self._load_thread is not None:
+diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/manager.py
+index 67c709cb4..ca75a3565 100644
+--- a/vllm/v1/simple_kv_offload/manager.py
++++ b/vllm/v1/simple_kv_offload/manager.py
+@@ -77,6 +77,7 @@ class SimpleCPUOffloadScheduler:
+         hash_block_size: int,
+         lazy_offload: bool = False,
+         disk_capacity_bytes: int = 0,
++        max_store_blocks_per_event: int = 0,
+     ):
+         self.vllm_config = vllm_config
+         self.kv_cache_config = kv_cache_config
+@@ -102,6 +103,7 @@ class SimpleCPUOffloadScheduler:
+             align_disk_blocks=disk_capacity_bytes > 0,
+         )
+         self.num_cpu_blocks = self.cpu_kv_cache_config.num_blocks
++        self.max_store_blocks_per_event = max_store_blocks_per_event
+         # Find the full attention kv group for prefix cache matching.
+         self.fa_gidx = -1
+         for g_idx, g in enumerate(self.cpu_kv_cache_config.kv_cache_groups):
+@@ -526,11 +528,16 @@ class SimpleCPUOffloadScheduler:
+         covered = 0
+         last_visited = self._cursor
+ 
++        max_store_blocks = (
++            min(num_cpu_free, self.max_store_blocks_per_event)
++            if self.max_store_blocks_per_event > 0
++            else num_cpu_free
++        )
+         while (
+             node is not None
+             and node is not tail
+             and covered < self._target_free
+-            and len(gpu_ids) < num_cpu_free
++            and len(gpu_ids) < max_store_blocks
+         ):
+             last_visited = node
+             bhash = node.block_hash
+@@ -588,6 +595,12 @@ class SimpleCPUOffloadScheduler:
+         num_groups = len(kv_cache_groups)
+         # Dedup against blocks already scheduled.
+         in_flight = self._in_flight_store_gpu_blocks
++        remaining_store_budget = (
++            self.max_store_blocks_per_event
++            if self.max_store_blocks_per_event > 0
++            else num_free
++        )
++        transfer_limit_reached = False
+ 
+         for req_id, new_block_id_groups, preempted in yield_req_data(scheduler_output):
+             state = self._reqs_to_store.get(req_id)
+@@ -662,13 +675,17 @@ class SimpleCPUOffloadScheduler:
+                     if num_free <= 0:
+                         out_of_space = True
+                         break
++                    if remaining_store_budget <= 0:
++                        transfer_limit_reached = True
++                        break
+                     num_free -= 1
++                    remaining_store_budget -= 1
+ 
+                     gpu_block_ids.append(gpu_block_id)
+                     block_hashes_to_store.append(bhash_with_group)
+                     advanced_per_group[g] += 1
+ 
+-                if out_of_space:
++                if out_of_space or transfer_limit_reached:
+                     break
+ 
+             # --- Phase 2: Batch allocate CPU blocks and stamp hashes ---
+@@ -703,6 +720,9 @@ class SimpleCPUOffloadScheduler:
+             for g in range(num_groups):
+                 state.num_stored_blocks[g] += advanced_per_group[g]
+ 
++            if transfer_limit_reached:
++                break
++
+         return merged_gpu_block_ids, merged_cpu_block_ids, req_ids
+ 
+     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
+diff --git a/vllm/v1/simple_kv_offload/worker.py b/vllm/v1/simple_kv_offload/worker.py
+index 2eb930704..e247c8bbf 100644
+--- a/vllm/v1/simple_kv_offload/worker.py
++++ b/vllm/v1/simple_kv_offload/worker.py
+@@ -40,6 +40,8 @@ class SimpleCPUOffloadWorker:
+         disk_buffer_slots: int = 2,
+         use_page_cache: bool = False,
+         preallocate_disk: bool = True,
++        disk_queue_depth: int = 2,
++        disk_enqueue_timeout_s: float = 30.0,
+     ):
+         self.vllm_config = vllm_config
+         self.kv_cache_config = kv_cache_config
+@@ -49,6 +51,8 @@ class SimpleCPUOffloadWorker:
+         self.disk_buffer_slots = disk_buffer_slots
+         self.use_page_cache = use_page_cache
+         self.preallocate_disk = preallocate_disk
++        self.disk_queue_depth = disk_queue_depth
++        self.disk_enqueue_timeout_s = disk_enqueue_timeout_s
+         self.disk_mode = kv_offload_backend == "disk"
+ 
+         self.gpu_kv_caches: dict[str, torch.Tensor] | None = None
+@@ -215,6 +219,8 @@ class SimpleCPUOffloadWorker:
+             self.disk_buffer_slots,
+             self.use_page_cache,
+             self.preallocate_disk,
++            self.disk_queue_depth,
++            self.disk_enqueue_timeout_s,
+         )
+ 
+     def shutdown(self) -> None:

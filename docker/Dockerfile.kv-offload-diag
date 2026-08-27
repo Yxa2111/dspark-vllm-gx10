@@ -16,6 +16,7 @@ COPY patches/vllm/0005-kv-offload-rank-zero-staging.patch /tmp/kv-offload-rank-z
 # not ship the upstream test tree, so apply the mechanically derived
 # runtime-only form here.
 COPY docker/packed-local-nvme-offload.patch /tmp/packed-local-nvme-offload.patch
+COPY docker/bound-local-nvme-work.patch /tmp/bound-local-nvme-work.patch
 
 RUN cd /usr/local/lib/python3.12/dist-packages && \
     patch --batch --forward --dry-run -p1 < /tmp/kv-offload-layout-diag.patch && \
@@ -30,6 +31,8 @@ RUN cd /usr/local/lib/python3.12/dist-packages && \
     patch --batch --forward -p1 < /tmp/kv-offload-rank-zero-staging.patch && \
     patch --batch --forward --dry-run -p1 < /tmp/packed-local-nvme-offload.patch && \
     patch --batch --forward -p1 < /tmp/packed-local-nvme-offload.patch && \
+    patch --batch --forward --dry-run -p1 < /tmp/bound-local-nvme-work.patch && \
+    patch --batch --forward -p1 < /tmp/bound-local-nvme-work.patch && \
     python3 -m py_compile \
       vllm/config/speculative.py \
       vllm/v1/kv_offload/diag.py \
@@ -58,4 +61,5 @@ RUN cd /usr/local/lib/python3.12/dist-packages && \
       /tmp/kv-offload-dspark-ephemeral-contract.patch \
       /tmp/kv-offload-cancellation-convergence.patch \
       /tmp/kv-offload-rank-zero-staging.patch \
-      /tmp/packed-local-nvme-offload.patch
+      /tmp/packed-local-nvme-offload.patch \
+      /tmp/bound-local-nvme-work.patch
