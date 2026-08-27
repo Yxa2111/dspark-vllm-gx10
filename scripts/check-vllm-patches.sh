@@ -42,10 +42,14 @@ python3 -m py_compile \
   "$tmp_dir/vllm/vllm/v1/kv_offload/tiering/base.py" \
   "$tmp_dir/vllm/vllm/v1/kv_offload/tiering/fs/thread_pool.py" \
   "$tmp_dir/vllm/vllm/v1/kv_offload/tiering/manager.py" \
+  "$tmp_dir/vllm/vllm/v1/kv_offload/cpu/distributed_staging.py" \
+  "$tmp_dir/vllm/vllm/v1/kv_offload/cpu/gpu_worker.py" \
+  "$tmp_dir/vllm/vllm/v1/kv_offload/cpu/shared_offload_region.py" \
   "$tmp_dir/vllm/vllm/v1/kv_offload/diag.py" \
   "$tmp_dir/vllm/vllm/v1/kv_offload/cpu/spec.py" \
   "$tmp_dir/vllm/vllm/v1/kv_offload/file_mapper.py" \
   "$tmp_dir/vllm/vllm/v1/kv_offload/tiering/fs/manager.py" \
+  "$tmp_dir/vllm/vllm/v1/kv_offload/tiering/spec.py" \
   "$tmp_dir/vllm/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py" \
   "$tmp_dir/vllm/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py"
 

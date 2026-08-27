@@ -1,0 +1,637 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
+index 2fd8b3839..0299df5f7 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
+@@ -129,13 +129,11 @@ class OffloadingConnectorWorker:
+                             (block_stride_bytes, 1),
+                         ),
+                     )
+                     storage_nbytes = layer_kv_cache.untyped_storage().nbytes()
+                     view_end_bytes = (
+-                        byte_offset
+-                        + max(num_blocks - 1, 0) * block_stride_bytes
+-                        + page
++                        byte_offset + max(num_blocks - 1, 0) * block_stride_bytes + page
+                     )
+                     emit_kv_offload_diag(
+                         "worker.register.attention_layer",
+                         layer_name=layer_name,
+                         packed=layer_is_packed[layer_name],
+@@ -149,10 +147,16 @@ class OffloadingConnectorWorker:
+                         real_page_size_bytes=layer_kv_cache_spec.real_page_size_bytes,
+                         block_stride_bytes=block_stride_bytes,
+                         view_end_bytes=view_end_bytes,
+                         bounds_ok=view_end_bytes <= storage_nbytes,
+                     )
++                    if view_end_bytes > storage_nbytes:
++                        raise ValueError(
++                            f"KV offload view for {layer_name} exceeds its "
++                            f"allocation: end={view_end_bytes}, "
++                            f"storage={storage_nbytes}"
++                        )
+                     page_size_bytes[layer_name] = layer_kv_cache_spec.page_size_bytes
+                     unpadded_page_size_bytes[layer_name] = (
+                         layer_kv_cache_spec.real_page_size_bytes
+                     )
+
+@@ -193,30 +197,35 @@ class OffloadingConnectorWorker:
+             None,
+         )
+         if packed_kv_cache_tensor is not None:
+             (tensor,) = tensors_per_block[packed_kv_cache_tensor.shared_by[0]]
+             block_stride = tensor.stride(0)
+-            packed_tensor = tensor.as_strided(
+-                (num_blocks, block_stride),
+-                (block_stride, 1),
+-                storage_offset=0,
+-            )
+-            packed_span_bytes = (
+-                max(num_blocks - 1, 0) * block_stride
+-                + (block_stride if num_blocks else 0)
++            packed_span_bytes = max(num_blocks - 1, 0) * block_stride + (
++                block_stride if num_blocks else 0
+             )
++            storage_nbytes = tensor.untyped_storage().nbytes()
+             emit_kv_offload_diag(
+                 "worker.register.packed_canonical",
+                 source_layer=packed_kv_cache_tensor.shared_by[0],
+                 num_blocks=num_blocks,
+                 block_stride_bytes=block_stride,
+-                storage_nbytes=tensor.untyped_storage().nbytes(),
++                storage_nbytes=storage_nbytes,
+                 packed_span_bytes=packed_span_bytes,
+                 bounds_ok=packed_span_bytes <= tensor.untyped_storage().nbytes(),
+                 canonical_tensor_count=1,
+                 canonical_group_count=len(kv_cache_config.kv_cache_groups),
+             )
++            if packed_span_bytes > storage_nbytes:
++                raise ValueError(
++                    "Packed KV offload view exceeds its allocation: "
++                    f"end={packed_span_bytes}, storage={storage_nbytes}"
++                )
++            packed_tensor = tensor.as_strided(
++                (num_blocks, block_stride),
++                (block_stride, 1),
++                storage_offset=0,
++            )
+             self._init_worker(
+                 CanonicalKVCaches(
+                     [CanonicalKVCacheTensor(packed_tensor, block_stride)],
+                     [
+                         [CanonicalKVCacheRef(0, block_stride)]
+diff --git a/vllm/v1/kv_offload/cpu/distributed_staging.py b/vllm/v1/kv_offload/cpu/distributed_staging.py
+new file mode 100644
+index 000000000..641e854bd
+--- /dev/null
++++ b/vllm/v1/kv_offload/cpu/distributed_staging.py
+@@ -0,0 +1,159 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Bounded cross-node relay for rank-zero CPU KV staging."""
++
++from collections.abc import Iterator, Sequence
++
++import numpy as np
++import torch
++import torch.distributed as dist
++from torch.distributed import ProcessGroup
++
++
++class RankZeroStagingRelay:
++    """Move per-rank CPU KV rows to and from rank zero.
++
++    Every rank owns ``local_tensors``. Rank zero additionally maps one tensor
++    list per remote rank into the scheduler-visible shared region. Transfers
++    are synchronous and bounded by ``max_chunk_bytes``; callers keep GPU DMA
++    asynchronous around this relay.
++    """
++
++    def __init__(
++        self,
++        local_tensors: list[torch.Tensor],
++        remote_tensors: dict[int, list[torch.Tensor]],
++        rank: int,
++        ranks: Sequence[int],
++        cpu_group: ProcessGroup,
++        max_chunk_bytes: int,
++    ) -> None:
++        if max_chunk_bytes <= 0:
++            raise ValueError("max_chunk_bytes must be positive")
++        if not ranks or ranks[0] != 0:
++            raise ValueError("rank-zero staging requires global rank 0 as owner")
++        if rank not in ranks:
++            raise ValueError(f"rank {rank} is not part of relay ranks {list(ranks)}")
++        if rank == 0 and set(remote_tensors) != set(ranks[1:]):
++            raise ValueError("rank zero must map every remote rank")
++        if rank != 0 and remote_tensors:
++            raise ValueError("non-owner ranks cannot map remote staging tensors")
++
++        self.local_tensors = local_tensors
++        self.remote_tensors = remote_tensors
++        self.rank = rank
++        self.ranks = list(ranks)
++        self.cpu_group = cpu_group
++        self.max_chunk_bytes = max_chunk_bytes
++        self.max_observed_payload_bytes = 0
++
++        for tensor in local_tensors:
++            self._validate_tensor(tensor)
++        for tensors in remote_tensors.values():
++            if len(tensors) != len(local_tensors):
++                raise ValueError("remote and local tensor counts differ")
++            for local, remote in zip(local_tensors, tensors):
++                self._validate_tensor(remote)
++                if remote.shape != local.shape:
++                    raise ValueError("remote and local staging shapes differ")
++
++    @staticmethod
++    def _validate_tensor(tensor: torch.Tensor) -> None:
++        if tensor.device.type != "cpu" or tensor.dtype != torch.int8:
++            raise ValueError("staging tensors must be CPU int8 tensors")
++        if tensor.ndim != 2:
++            raise ValueError("staging tensors must have shape (blocks, bytes)")
++
++    def all_ranks_ready(self, ready: bool) -> bool:
++        """Return true only when every relay rank reports a ready DMA job."""
++        flag = torch.tensor([int(ready)], dtype=torch.int32)
++        dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=self.cpu_group)
++        return bool(flag.item())
++
++    def stage_store(self, job_id: int, block_ids: np.ndarray) -> int:
++        """Gather remote-rank rows into rank zero's shared region."""
++        return self._exchange(job_id, block_ids, store=True)
++
++    def stage_load(self, job_id: int, block_ids: np.ndarray) -> int:
++        """Scatter rank zero's shared rows into remote-rank local staging."""
++        return self._exchange(job_id, block_ids, store=False)
++
++    def _exchange(self, job_id: int, block_ids: np.ndarray, store: bool) -> int:
++        if block_ids.ndim != 1:
++            raise ValueError("block_ids must be one-dimensional")
++        if not len(block_ids) or len(self.ranks) == 1:
++            return 0
++
++        total_bytes = 0
++        tag = int(job_id % 2_147_483_647)
++        for peer_global_rank in self.ranks[1:]:
++            if self.rank not in (0, peer_global_rank):
++                continue
++
++            remote_views = self.remote_tensors.get(peer_global_rank)
++            for tensor_idx, local_tensor in enumerate(self.local_tensors):
++                owner_tensor = (
++                    remote_views[tensor_idx]
++                    if self.rank == 0 and remote_views is not None
++                    else local_tensor
++                )
++                for index in self._iter_indices(block_ids, local_tensor.shape[1]):
++                    payload_shape = (len(index), local_tensor.shape[1])
++                    payload_bytes = payload_shape[0] * payload_shape[1]
++                    self.max_observed_payload_bytes = max(
++                        self.max_observed_payload_bytes, payload_bytes
++                    )
++                    total_bytes += payload_bytes
++
++                    if store:
++                        if self.rank == peer_global_rank:
++                            payload = local_tensor.index_select(0, index).contiguous()
++                            dist.send(
++                                payload,
++                                dst=self.ranks[0],
++                                group=self.cpu_group,
++                                tag=tag,
++                            )
++                        else:
++                            payload = torch.empty(payload_shape, dtype=torch.int8)
++                            dist.recv(
++                                payload,
++                                src=peer_global_rank,
++                                group=self.cpu_group,
++                                tag=tag,
++                            )
++                            owner_tensor.index_copy_(0, index, payload)
++                    elif self.rank == 0:
++                        payload = owner_tensor.index_select(0, index).contiguous()
++                        dist.send(
++                            payload,
++                            dst=peer_global_rank,
++                            group=self.cpu_group,
++                            tag=tag,
++                        )
++                    else:
++                        payload = torch.empty(payload_shape, dtype=torch.int8)
++                        dist.recv(
++                            payload,
++                            src=self.ranks[0],
++                            group=self.cpu_group,
++                            tag=tag,
++                        )
++                        local_tensor.index_copy_(0, index, payload)
++        return total_bytes
++
++    def _iter_indices(
++        self, block_ids: np.ndarray, page_size: int
++    ) -> Iterator[torch.Tensor]:
++        blocks_per_chunk = max(1, self.max_chunk_bytes // page_size)
++        for start in range(0, len(block_ids), blocks_per_chunk):
++            chunk = np.array(
++                block_ids[start : start + blocks_per_chunk],
++                dtype=np.int64,
++                copy=True,
++            )
++            yield torch.from_numpy(chunk)
++
++    def shutdown(self) -> None:
++        self.remote_tensors.clear()
++        self.local_tensors = []
+diff --git a/vllm/v1/kv_offload/cpu/gpu_worker.py b/vllm/v1/kv_offload/cpu/gpu_worker.py
+index c8b9915a1..a4d672be3 100644
+--- a/vllm/v1/kv_offload/cpu/gpu_worker.py
++++ b/vllm/v1/kv_offload/cpu/gpu_worker.py
+@@ -7,10 +7,11 @@ from dataclasses import dataclass
+
+ import numpy as np
+ import torch
+
+ from vllm import _custom_ops as ops
++from vllm.distributed.parallel_state import get_tp_group
+ from vllm.logger import init_logger
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import HAS_TRITON, triton
+ from vllm.utils.math_utils import cdiv
+ from vllm.utils.torch_utils import PIN_MEMORY
+@@ -21,10 +22,11 @@ from vllm.v1.kv_offload.base import (
+     GPULoadStoreSpec,
+     LoadStoreSpec,
+     OffloadingWorker,
+     TransferResult,
+ )
++from vllm.v1.kv_offload.cpu.distributed_staging import RankZeroStagingRelay
+ from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+ from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
+     THRESHOLD_BYTES,
+     swap_blocks_batch,
+ )
+@@ -68,10 +70,16 @@ class Transfer:
+     batch_src: torch.Tensor
+     batch_dst: torch.Tensor
+     batch_sizes: torch.Tensor
+
+
++@dataclass
++class DistributedStore:
++    job_id: int
++    block_ids: np.ndarray
++
++
+ def compute_sub_block_ptrs(
+     block_ids: np.ndarray,
+     block_size_factor: int,
+     output: np.ndarray,
+     tensor: torch.Tensor,
+@@ -477,18 +485,23 @@ class CPUOffloadingWorker(OffloadingWorker):
+         self,
+         kv_caches: CanonicalKVCaches,
+         block_size_factor: int,
+         num_cpu_blocks: int,
+         mmap_region: SharedOffloadRegion | None = None,
++        distributed_staging: bool = False,
++        rank: int = 0,
++        world_size: int = 1,
++        max_transfer_chunk_bytes: int = 64 * 1024 * 1024,
+     ):
+         pin_memory = PIN_MEMORY
+         logger.info("Allocating %d CPU tensors...", len(kv_caches.tensors))
+         if mmap_region is not None and pin_memory:
+             pin_mmap_region(mmap_region)
+
+         gpu_tensors: list[torch.Tensor] = []
+         cpu_tensors: list[torch.Tensor] = []
++        cpu_page_sizes: list[int] = []
+         for kv_cache_tensor in kv_caches.tensors:
+             gpu_page_size_bytes = kv_cache_tensor.page_size_bytes
+             gpu_tensor = kv_cache_tensor.tensor.view(torch.int8).view(
+                 (-1, gpu_page_size_bytes)
+             )
+@@ -512,10 +525,46 @@ class CPUOffloadingWorker(OffloadingWorker):
+                     time.monotonic() - t0,
+                 )
+
+             gpu_tensors.append(gpu_tensor)
+             cpu_tensors.append(cpu_tensor)
++            cpu_page_sizes.append(cpu_page_size_bytes)
++
++        self._staging_relay: RankZeroStagingRelay | None = None
++        self._distributed_stores: deque[DistributedStore] = deque()
++        self._ready_store_results: dict[int, TransferResult] = {}
++        if distributed_staging:
++            if world_size <= 1:
++                raise ValueError("distributed staging requires multiple workers")
++            tp_group = get_tp_group()
++            if list(tp_group.ranks) != list(range(world_size)):
++                raise ValueError(
++                    "distributed staging requires a contiguous TP-only world"
++                )
++            if rank != tp_group.rank_in_group:
++                raise ValueError("worker rank and TP group rank differ")
++
++            remote_tensors: dict[int, list[torch.Tensor]] = {}
++            if rank == 0:
++                if mmap_region is None:
++                    raise ValueError("rank zero requires the shared staging region")
++                for remote_rank in range(1, world_size):
++                    remote_tensors[remote_rank] = [
++                        mmap_region.create_rank_view(remote_rank, page_size)
++                        for page_size in cpu_page_sizes
++                    ]
++            elif mmap_region is not None:
++                raise ValueError("remote ranks must use process-local staging")
++
++            self._staging_relay = RankZeroStagingRelay(
++                local_tensors=cpu_tensors,
++                remote_tensors=remote_tensors,
++                rank=rank,
++                ranks=tp_group.ranks,
++                cpu_group=tp_group.cpu_group,
++                max_chunk_bytes=max_transfer_chunk_bytes,
++            )
+
+         self._store_handler = SingleDirectionOffloadingHandler(
+             gpu_tensors=gpu_tensors,
+             cpu_tensors=cpu_tensors,
+             block_size_factor=block_size_factor,
+@@ -534,23 +583,55 @@ class CPUOffloadingWorker(OffloadingWorker):
+
+     def submit_store(
+         self, job_id: int, src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec
+     ) -> bool:
+         """Async GPU -> CPU."""
+-        return self._store_handler.transfer_async(job_id, src_spec, dst_spec)
++        success = self._store_handler.transfer_async(job_id, src_spec, dst_spec)
++        if success and self._staging_relay is not None:
++            assert isinstance(dst_spec, BlockIDsLoadStoreSpec)
++            self._distributed_stores.append(
++                DistributedStore(job_id=job_id, block_ids=dst_spec.block_ids.copy())
++            )
++        return success
+
+     def submit_load(
+         self, job_id: int, src_spec: LoadStoreSpec, dst_spec: GPULoadStoreSpec
+     ) -> bool:
+         """Async CPU -> GPU."""
++        if self._staging_relay is not None:
++            assert isinstance(src_spec, BlockIDsLoadStoreSpec)
++            self._staging_relay.stage_load(job_id, src_spec.block_ids)
+         return self._load_handler.transfer_async(job_id, src_spec, dst_spec)
+
+     def get_finished(self) -> list[TransferResult]:
+-        return self._store_handler.get_finished() + self._load_handler.get_finished()
++        store_results = self._store_handler.get_finished()
++        if self._staging_relay is None:
++            return store_results + self._load_handler.get_finished()
++
++        self._ready_store_results.update(
++            (result.job_id, result) for result in store_results
++        )
++        completed_stores: list[TransferResult] = []
++        while self._distributed_stores:
++            store = self._distributed_stores[0]
++            local_ready = store.job_id in self._ready_store_results
++            if not self._staging_relay.all_ranks_ready(local_ready):
++                break
++            assert local_ready
++            self._staging_relay.stage_store(store.job_id, store.block_ids)
++            completed_stores.append(self._ready_store_results.pop(store.job_id))
++            self._distributed_stores.popleft()
++
++        return completed_stores + self._load_handler.get_finished()
+
+     def wait(self, job_ids: set[int]) -> None:
+         self._store_handler.wait(job_ids)
+         self._load_handler.wait(job_ids)
+
+     def shutdown(self) -> None:
++        if self._staging_relay is not None:
++            self._staging_relay.shutdown()
++            self._staging_relay = None
++        self._distributed_stores.clear()
++        self._ready_store_results.clear()
+         self._store_handler.shutdown()
+         self._load_handler.shutdown()
+diff --git a/vllm/v1/kv_offload/cpu/shared_offload_region.py b/vllm/v1/kv_offload/cpu/shared_offload_region.py
+index d5400e0ca..16d95836a 100644
+--- a/vllm/v1/kv_offload/cpu/shared_offload_region.py
++++ b/vllm/v1/kv_offload/cpu/shared_offload_region.py
+@@ -43,26 +43,43 @@ class SharedOffloadRegion:
+         instance_id: str,
+         num_blocks: int,
+         rank: int | None,
+         kv_bytes_per_block: int,
+         cpu_page_size: int,
++        num_worker_slots: int | None = None,
+     ) -> None:
+         self.page_size = mmap.PAGESIZE
+         assert kv_bytes_per_block % self.page_size == 0
+
+         self.num_blocks = num_blocks
+         self._row_stride = kv_bytes_per_block
++        if cpu_page_size <= 0:
++            raise ValueError("per-worker page size must be positive")
++        self._cpu_page_size = cpu_page_size
++        if num_worker_slots is None:
++            num_worker_slots = max(1, self._row_stride // cpu_page_size)
++        if num_worker_slots <= 0:
++            raise ValueError("worker slot count must be positive")
++        slots_end = num_worker_slots * cpu_page_size
++        if slots_end > self._row_stride:
++            raise ValueError(
++                "per-worker slots exceed the aligned row stride: "
++                f"slots_end={slots_end}, row_stride={self._row_stride}"
++            )
++        self._num_worker_slots = num_worker_slots
++        self._tail_padding = self._row_stride - slots_end
+         self.total_size_bytes = self.num_blocks * self._row_stride
+
+         self.mmap_path = f"/dev/shm/vllm_offload_{instance_id}.mmap"
+         self._creator = False  # set True only if this worker creates the file
+         self.rank = rank
+-        if rank is not None:
+-            # byte offset to this worker's first slot within each block row
+-            self._worker_offset = rank * cpu_page_size
+-            # exclusive upper bound for this worker's area within each row
+-            self._worker_area_end = (rank + 1) * cpu_page_size
++        if rank is not None and not 0 <= rank < self._num_worker_slots:
++            raise ValueError(
++                f"rank {rank} outside {self._num_worker_slots} staging slots"
++            )
++        self._rank_offsets: dict[int, int] = {}
++        self._worker_offset = rank * cpu_page_size if rank is not None else 0
+         try:
+             # Exclusive create — only one worker succeeds
+             self.fd: int | None = os.open(
+                 self.mmap_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600
+             )
+@@ -138,23 +155,35 @@ class SharedOffloadRegion:
+
+         Args:
+             tensor_page_size: Bytes per block for this  tensor.
+         """
+         assert self.rank is not None
+-        new_offset = self._worker_offset + tensor_page_size
+-        assert new_offset <= self._worker_area_end, (
++        return self.create_rank_view(self.rank, tensor_page_size)
++
++    def create_rank_view(self, rank: int, tensor_page_size: int) -> torch.Tensor:
++        """Allocate the next tensor view within an explicit worker slot."""
++        if not 0 <= rank < self._num_worker_slots:
++            raise ValueError(
++                f"rank {rank} outside {self._num_worker_slots} staging slots"
++            )
++        worker_start = rank * self._cpu_page_size
++        worker_end = worker_start + self._cpu_page_size
++        current_offset = self._rank_offsets.get(rank, worker_start)
++        new_offset = current_offset + tensor_page_size
++        assert new_offset <= worker_end, (
+             f"Worker offset {new_offset} exceeds worker area end "
+-            f"{self._worker_area_end} (overflowed by "
+-            f"{new_offset - self._worker_area_end} bytes)"
++            f"{worker_end} (overflowed by {new_offset - worker_end} bytes)"
+         )
+         worker_layer_view = torch.as_strided(
+             self._base,
+             size=(self.num_blocks, tensor_page_size),
+             stride=(self._row_stride, 1),
+-            storage_offset=self._worker_offset,
++            storage_offset=current_offset,
+         )
+-        self._worker_offset = new_offset
++        self._rank_offsets[rank] = new_offset
++        if rank == self.rank:
++            self._worker_offset = new_offset
+         self._views.append(worker_layer_view)
+         return worker_layer_view
+
+     def create_kv_memoryview(self) -> memoryview:
+         """Return a zero-copy memoryview over the entire KV buffer.
+diff --git a/vllm/v1/kv_offload/tiering/spec.py b/vllm/v1/kv_offload/tiering/spec.py
+index 406c94e3d..5cda9ede1 100644
+--- a/vllm/v1/kv_offload/tiering/spec.py
++++ b/vllm/v1/kv_offload/tiering/spec.py
+@@ -9,10 +9,14 @@ and configurable secondary tiers (e.g., Storage, Network).
+ Configuration via kv_connector_extra_config:
+   - cpu_bytes_to_use: (required) Bytes to allocate for CPU primary tier
+   - block_size: (optional) Block size for offloaded blocks (default: GPU block size)
+   - eviction_policy: (optional) Primary tier eviction policy: "lru" or
+     "arc" (default: "lru")
++  - distributed_staging: (optional) Set to "rank0" for multi-node MP. Remote
++    workers relay bounded per-rank staging rows to rank zero (default: disabled)
++  - max_transfer_chunk_bytes: (optional) Bound for each relay payload
++    (default: 64 MiB)
+   - secondary_tiers: (optional) List of secondary tier configurations
+     Each secondary tier config is a dict with:
+       - type: (required) Type of secondary tier (e.g., "example", "storage", "network")
+       - Additional tier-specific parameters are passed directly to the tier
+         constructor. See each tier's documentation for supported parameters.
+@@ -31,11 +35,10 @@ Example configuration:
+ }
+ """
+
+ from typing import Any
+
+-import torch
+ from typing_extensions import override
+
+ from vllm.config import VllmConfig
+ from vllm.logger import init_logger
+ from vllm.v1.kv_cache_interface import KVCacheConfig
+@@ -103,10 +106,42 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
+         # Parse secondary tier configurations
+         self.secondary_tier_configs = self.extra_config.get("secondary_tiers", [])
+         if not isinstance(self.secondary_tier_configs, list):
+             raise ValueError("secondary_tiers must be a list of tier configurations")
+
++        self.distributed_staging = str(
++            self.extra_config.get("distributed_staging", "disabled")
++        )
++        if self.distributed_staging not in ("disabled", "rank0"):
++            raise ValueError("distributed_staging must be 'disabled' or 'rank0'")
++        self.max_transfer_chunk_bytes = int(
++            self.extra_config.get("max_transfer_chunk_bytes", 64 * 1024 * 1024)
++        )
++        if self.max_transfer_chunk_bytes <= 0:
++            raise ValueError("max_transfer_chunk_bytes must be positive")
++
++        parallel = self.vllm_config.parallel_config
++        if parallel.nnodes > 1 and self.distributed_staging != "rank0":
++            raise ValueError(
++                "multi-node TieringOffloadingSpec requires "
++                "distributed_staging='rank0'; host-local shared mmap is unsafe"
++            )
++        if self.distributed_staging == "rank0":
++            if parallel.nnodes <= 1:
++                raise ValueError("rank0 distributed staging requires nnodes > 1")
++            if parallel.distributed_executor_backend != "mp":
++                raise ValueError("rank0 distributed staging requires the MP executor")
++            if (
++                parallel.world_size != parallel.tensor_parallel_size
++                or parallel.pipeline_parallel_size != 1
++                or parallel.prefill_context_parallel_size != 1
++                or parallel.decode_context_parallel_size != 1
++            ):
++                raise ValueError(
++                    "rank0 distributed staging currently supports a TP-only world"
++                )
++
+         # Scheduler-side mmap (rank=None); kept for cleanup
+         self._scheduler_mmap: SharedOffloadRegion | None = None
+
+     @override
+     def get_manager(self) -> OffloadingManager:
+@@ -127,10 +162,11 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
+                 instance_id=self.vllm_config.instance_id,
+                 num_blocks=self.num_blocks,
+                 rank=None,
+                 kv_bytes_per_block=self.kv_bytes_per_offloaded_block,
+                 cpu_page_size=self.cpu_page_size_per_worker,
++                num_worker_slots=self.vllm_config.parallel_config.world_size,
+             )
+             self._scheduler_mmap = scheduler_mmap
+
+             # Create primary tier (CPU-based)
+             primary_tier = CPUPrimaryTierOffloadingManager(
+@@ -186,19 +222,27 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
+
+         return self._manager
+
+     @override
+     def create_worker(self, kv_caches: CanonicalKVCaches) -> CPUOffloadingWorker:
+-        rank = torch.accelerator.current_device_index()
+-        worker_mmap = SharedOffloadRegion(
+-            instance_id=self.vllm_config.instance_id,
+-            num_blocks=self.num_blocks,
+-            rank=rank,
+-            kv_bytes_per_block=self.kv_bytes_per_offloaded_block,
+-            cpu_page_size=self.cpu_page_size_per_worker,
+-        )
++        rank = self.vllm_config.parallel_config.rank
++        use_distributed_staging = self.distributed_staging == "rank0"
++        worker_mmap = None
++        if not use_distributed_staging or rank == 0:
++            worker_mmap = SharedOffloadRegion(
++                instance_id=self.vllm_config.instance_id,
++                num_blocks=self.num_blocks,
++                rank=rank,
++                kv_bytes_per_block=self.kv_bytes_per_offloaded_block,
++                cpu_page_size=self.cpu_page_size_per_worker,
++                num_worker_slots=self.vllm_config.parallel_config.world_size,
++            )
+         return CPUOffloadingWorker(
+             kv_caches=kv_caches,
+             block_size_factor=self.block_size_factor,
+             num_cpu_blocks=self.num_blocks,
+             mmap_region=worker_mmap,
++            distributed_staging=use_distributed_staging,
++            rank=rank,
++            world_size=self.vllm_config.parallel_config.world_size,
++            max_transfer_chunk_bytes=self.max_transfer_chunk_bytes,
+         )

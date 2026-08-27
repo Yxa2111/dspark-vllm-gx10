@@ -11,6 +11,7 @@ COPY patches/vllm/0001-kv-offload-layout-diag.patch /tmp/kv-offload-layout-diag.
 COPY patches/vllm/0002-kv-offload-fs-lookup-diag.patch /tmp/kv-offload-fs-lookup-diag.patch
 COPY patches/vllm/0003-kv-offload-dspark-ephemeral-contract.patch /tmp/kv-offload-dspark-ephemeral-contract.patch
 COPY patches/vllm/0004-kv-offload-cancellation-convergence.patch /tmp/kv-offload-cancellation-convergence.patch
+COPY patches/vllm/0005-kv-offload-rank-zero-staging.patch /tmp/kv-offload-rank-zero-staging.patch
 
 RUN cd /usr/local/lib/python3.12/dist-packages && \
     patch --batch --forward --dry-run -p1 < /tmp/kv-offload-layout-diag.patch && \
@@ -21,6 +22,8 @@ RUN cd /usr/local/lib/python3.12/dist-packages && \
     patch --batch --forward -p1 < /tmp/kv-offload-dspark-ephemeral-contract.patch && \
     patch --batch --forward --dry-run -p1 < /tmp/kv-offload-cancellation-convergence.patch && \
     patch --batch --forward -p1 < /tmp/kv-offload-cancellation-convergence.patch && \
+    patch --batch --forward --dry-run -p1 < /tmp/kv-offload-rank-zero-staging.patch && \
+    patch --batch --forward -p1 < /tmp/kv-offload-rank-zero-staging.patch && \
     python3 -m py_compile \
       vllm/config/speculative.py \
       vllm/v1/kv_offload/diag.py \
@@ -30,12 +33,17 @@ RUN cd /usr/local/lib/python3.12/dist-packages && \
       vllm/v1/kv_offload/tiering/base.py \
       vllm/v1/kv_offload/tiering/fs/thread_pool.py \
       vllm/v1/kv_offload/tiering/manager.py \
+      vllm/v1/kv_offload/cpu/distributed_staging.py \
+      vllm/v1/kv_offload/cpu/gpu_worker.py \
+      vllm/v1/kv_offload/cpu/shared_offload_region.py \
       vllm/v1/kv_offload/cpu/spec.py \
       vllm/v1/kv_offload/file_mapper.py \
       vllm/v1/kv_offload/tiering/fs/manager.py \
+      vllm/v1/kv_offload/tiering/spec.py \
       vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py \
       vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py && \
     rm -f /tmp/kv-offload-layout-diag.patch \
       /tmp/kv-offload-fs-lookup-diag.patch \
       /tmp/kv-offload-dspark-ephemeral-contract.patch \
-      /tmp/kv-offload-cancellation-convergence.patch
+      /tmp/kv-offload-cancellation-convergence.patch \
+      /tmp/kv-offload-rank-zero-staging.patch
