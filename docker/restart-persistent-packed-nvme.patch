@@ -404,7 +404,7 @@ index ca75a3565..5e3398b34 100644
          # GPU block pool reference - bound after scheduler builds kv_cache_manager
          self._gpu_block_pool: BlockPool | None = None
  
-@@ -191,6 +222,34 @@ class SimpleCPUOffloadScheduler:
+@@ -191,6 +222,42 @@ class SimpleCPUOffloadScheduler:
          self._expected_worker_count = vllm_config.parallel_config.world_size
          self._store_event_pending_counts: dict[int, int] = {}
  
@@ -418,6 +418,7 @@ index ca75a3565..5e3398b34 100644
 +        assert self._persistent_index is not None
 +        mappings = self._persistent_index.load()
 +        num_groups = len(self.cpu_kv_cache_config.kv_cache_groups)
++        restored_blocks = []
 +        for slot, raw_hash in mappings.items():
 +            block = self.cpu_block_pool.blocks[slot]
 +            if block.is_null:
@@ -433,6 +434,13 @@ index ca75a3565..5e3398b34 100644
 +                )
 +            block.set_block_hash(block_hash)
 +            self.cpu_block_pool.cached_block_hash_to_block.insert(block_hash, block)
++            restored_blocks.append(block)
++        if restored_blocks:
++            # A new BlockPool starts with every non-null block in slot order in
++            # the free queue. Move restored cache entries to the LRU tail so
++            # never-used slots are allocated before durable data is evicted.
++            self.cpu_block_pool.touch(restored_blocks)
++            self.cpu_block_pool.free_blocks(restored_blocks)
 +        if mappings:
 +            logger.info("Restored %d committed persistent KV slots", len(mappings))
 +
