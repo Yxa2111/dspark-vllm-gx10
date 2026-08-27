@@ -16,6 +16,7 @@ document, implementation, tests, and commit all agree.
 | 08 | [`STEP-08-RESTART-PERSISTENCE-AUDIT.md`](STEP-08-RESTART-PERSISTENCE-AUDIT.md) | crash-safe rank-local restart-persistence contract | audit complete; implemented in Step 09 |
 | 09 | [`STEP-09-PERSISTENT-INDEX-IMPLEMENTATION.md`](STEP-09-PERSISTENT-INDEX-IMPLEMENTATION.md) | durable rank manifests and scheduler commit index | offline implementation complete; live restart passed in Step 10 |
 | 10 | [`STEP-10-TP2-RESTART-PROOF.md`](STEP-10-TP2-RESTART-PROOF.md) | interrupted-store authority and full TP=2 restart replay | functional restart gate passed; fault recovery and production stability remain |
+| 11 | [`STEP-11-PERSISTENT-LRU-RESTORE.md`](STEP-11-PERSISTENT-LRU-RESTORE.md) | restore BlockPool eviction order and retain prefixes while empty slots remain | fixed; offline and TP=2 restart gates passed |
 
 The source baseline is fixed by `upstream.lock`. Production changes remain an
 ordered patch series until they are accepted upstream; thin-image patching is
