@@ -1,0 +1,1305 @@
+diff --git a/tests/v1/simple_kv_offload/test_disk_backend.py b/tests/v1/simple_kv_offload/test_disk_backend.py
+index 7b4ac80ba..d5d2b07d7 100644
+--- a/tests/v1/simple_kv_offload/test_disk_backend.py
++++ b/tests/v1/simple_kv_offload/test_disk_backend.py
+@@ -99,9 +99,7 @@ def test_background_failure_is_raised_on_engine_thread() -> None:
+         backend.raise_if_failed()
+ 
+ 
+-def test_preallocation_enospc_closes_and_unlinks(
+-    tmp_path, monkeypatch
+-) -> None:
++def test_preallocation_enospc_closes_and_unlinks(tmp_path, monkeypatch) -> None:
+     monkeypatch.setattr(disk_backend_module, "pin_tensor", lambda _tensor: None)
+     monkeypatch.setattr(
+         disk_backend_module,
+@@ -137,6 +135,115 @@ def test_preallocation_enospc_closes_and_unlinks(
+     assert backend._load_thread is None
+ 
+ 
++def test_persistent_backend_reopens_data_and_checksums(tmp_path, monkeypatch) -> None:
++    monkeypatch.setattr(disk_backend_module, "pin_tensor", lambda _tensor: None)
++    monkeypatch.setattr(
++        disk_backend_module,
++        "current_platform",
++        SimpleNamespace(set_device=lambda _device: None),
++    )
++    monkeypatch.setattr(
++        disk_backend_module,
++        "build_params",
++        lambda *_args, **_kwargs: object(),
++    )
++    path = tmp_path / "persistent.slots"
++    identity = {
++        "cache_identity": "backend-unit-test",
++        "payload_bytes": 4096,
++        "rank": 0,
++        "slot_bytes": 4096,
++        "world_size": 2,
++    }
++
++    first = DiskBackend()
++    first.init(
++        {"kv": torch.zeros((2, 4096), dtype=torch.int8)},
++        torch.device("cpu"),
++        SimpleNamespace(cuda_stream=1),
++        SimpleNamespace(cuda_stream=2),
++        str(path),
++        num_disk_slots=2,
++        total_block_bytes=4096,
++        use_page_cache=True,
++        preallocate_disk=False,
++        persistent=True,
++        persistent_identity=identity,
++    )
++    first._store_raw[0].copy_(
++        torch.arange(4096, dtype=torch.int64).remainder(251).to(torch.int8)
++    )
++    expected = first._store_raw[0].clone()
++    first._writev_slot(0, 1)
++    os.fdatasync(first._fd)
++    assert first._manifest is not None
++    checksum = first._slot_checksums[1]
++    assert checksum is not None
++    first._manifest.commit({1: checksum})
++    first.shutdown()
++
++    assert path.exists()
++    assert (tmp_path / "persistent.slots.meta").exists()
++    second = DiskBackend()
++    second.init(
++        {"kv": torch.zeros((2, 4096), dtype=torch.int8)},
++        torch.device("cpu"),
++        SimpleNamespace(cuda_stream=1),
++        SimpleNamespace(cuda_stream=2),
++        str(path),
++        num_disk_slots=2,
++        total_block_bytes=4096,
++        use_page_cache=True,
++        preallocate_disk=False,
++        persistent=True,
++        persistent_identity=identity,
++    )
++    try:
++        second._readv_slot(0, 1)
++        assert torch.equal(second._load_raw[0], expected)
++        os.pwrite(second._fd, b"corrupt", 17 + 4096)
++        with pytest.raises(OSError, match="checksum mismatch"):
++            second._readv_slot(0, 1)
++    finally:
++        second.shutdown()
++
++
++def test_process_lifetime_backend_still_unlinks_on_start_and_stop(
++    tmp_path, monkeypatch
++) -> None:
++    monkeypatch.setattr(disk_backend_module, "pin_tensor", lambda _tensor: None)
++    monkeypatch.setattr(
++        disk_backend_module,
++        "current_platform",
++        SimpleNamespace(set_device=lambda _device: None),
++    )
++    monkeypatch.setattr(
++        disk_backend_module,
++        "build_params",
++        lambda *_args, **_kwargs: object(),
++    )
++    path = tmp_path / "process-lifetime.slots"
++    path.write_bytes(b"stale")
++    path.chmod(0o600)
++
++    backend = DiskBackend()
++    backend.init(
++        {"kv": torch.zeros((2, 4096), dtype=torch.int8)},
++        torch.device("cpu"),
++        SimpleNamespace(cuda_stream=1),
++        SimpleNamespace(cuda_stream=2),
++        str(path),
++        num_disk_slots=2,
++        total_block_bytes=4096,
++        use_page_cache=True,
++        preallocate_disk=False,
++    )
++    assert path.exists()
++    assert path.stat().st_size == 8192
++    backend.shutdown()
++    assert not path.exists()
++
++
+ def test_batch_copy_uses_independent_row_strides(monkeypatch) -> None:
+     monkeypatch.setattr(cuda_mem_ops, "_batch_memcpy_fn", object())
+     src = {"kv": torch.zeros((2, 3), dtype=torch.int8)}
+diff --git a/tests/v1/simple_kv_offload/test_persistent_metadata.py b/tests/v1/simple_kv_offload/test_persistent_metadata.py
+new file mode 100644
+index 000000000..2f9fc30dc
+--- /dev/null
++++ b/tests/v1/simple_kv_offload/test_persistent_metadata.py
+@@ -0,0 +1,233 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from __future__ import annotations
++
++import os
++
++import pytest
++
++from vllm.v1.simple_kv_offload.persistent_metadata import (
++    RankSlotManifest,
++    SchedulerSlotIndex,
++)
++
++
++def _identity(**overrides: object) -> dict[str, object]:
++    identity: dict[str, object] = {
++        "cache_identity": "dsv4-0731-test",
++        "payload_bytes": 1065792,
++        "rank": 0,
++        "slot_bytes": 1069056,
++        "world_size": 2,
++    }
++    identity.update(overrides)
++    return identity
++
++
++def test_rank_manifest_reopens_checksums_and_invalidations(tmp_path) -> None:
++    path = tmp_path / "slots.rank_0.meta"
++    manifest = RankSlotManifest(str(path), 4, _identity())
++    manifest.commit({1: 0x12345678, 3: 0xAABBCCDD})
++    manifest.invalidate([3])
++    manifest.close()
++
++    reopened = RankSlotManifest(str(path), 4, _identity())
++    assert reopened.load() == [None, 0x12345678, None, None]
++    reopened.close()
++    assert path.stat().st_mode & 0o777 == 0o600
++
++
++def test_scheduler_index_reopens_raw_hashes_and_invalidations(tmp_path) -> None:
++    path = tmp_path / "slots.index"
++    index = SchedulerSlotIndex(str(path), 4, _identity(rank="scheduler"))
++    index.commit({1: b"a" * 36, 2: b"b" * 12})
++    index.invalidate([2])
++    index.close()
++
++    reopened = SchedulerSlotIndex(str(path), 4, _identity(rank="scheduler"))
++    assert reopened.load() == {1: b"a" * 36}
++    reopened.close()
++
++
++@pytest.mark.parametrize(
++    "changed",
++    [
++        {"cache_identity": "another-model"},
++        {"payload_bytes": 1},
++        {"rank": 1},
++        {"slot_bytes": 4096},
++        {"world_size": 1},
++    ],
++)
++def test_identity_or_geometry_mismatch_is_rejected(tmp_path, changed) -> None:
++    path = tmp_path / "slots.rank_0.meta"
++    RankSlotManifest(str(path), 4, _identity()).close()
++
++    with pytest.raises(ValueError, match="identity mismatch"):
++        RankSlotManifest(str(path), 4, _identity(**changed))
++
++
++def test_wrong_size_and_symlink_are_rejected(tmp_path) -> None:
++    path = tmp_path / "slots.index"
++    SchedulerSlotIndex(str(path), 4, _identity()).close()
++    with path.open("ab") as stream:
++        stream.write(b"extra")
++
++    with pytest.raises(ValueError, match="size mismatch"):
++        SchedulerSlotIndex(str(path), 4, _identity())
++
++    target = tmp_path / "target"
++    target.write_bytes(b"")
++    target.chmod(0o600)
++    link = tmp_path / "link"
++    link.symlink_to(target)
++    with pytest.raises(OSError):
++        RankSlotManifest(str(link), 4, _identity())
++
++
++@pytest.mark.parametrize("kind", ["rank", "index"])
++def test_header_and_record_corruption_are_rejected(tmp_path, kind) -> None:
++    path = tmp_path / kind
++    if kind == "rank":
++        metadata = RankSlotManifest(str(path), 4, _identity())
++        metadata.commit({1: 0x12345678})
++    else:
++        metadata = SchedulerSlotIndex(str(path), 4, _identity())
++        metadata.commit({1: b"h" * 36})
++    record_size = metadata.record_size
++    metadata.close()
++
++    fd = os.open(path, os.O_RDWR)
++    try:
++        byte = os.pread(fd, 1, 4096 + record_size)
++        os.pwrite(fd, bytes([byte[0] ^ 0x80]), 4096 + record_size)
++    finally:
++        os.close(fd)
++
++    reopened = (
++        RankSlotManifest(str(path), 4, _identity())
++        if kind == "rank"
++        else SchedulerSlotIndex(str(path), 4, _identity())
++    )
++    with pytest.raises(ValueError, match="corrupt persistent"):
++        reopened.load()
++    reopened.close()
++
++    fd = os.open(path, os.O_RDWR)
++    try:
++        byte = os.pread(fd, 1, 64)
++        os.pwrite(fd, bytes([byte[0] ^ 1]), 64)
++    finally:
++        os.close(fd)
++    with pytest.raises(ValueError, match="identity mismatch"):
++        if kind == "rank":
++            RankSlotManifest(str(path), 4, _identity())
++        else:
++            SchedulerSlotIndex(str(path), 4, _identity())
++
++
++def test_hash_length_and_slot_bounds_fail_closed(tmp_path) -> None:
++    index = SchedulerSlotIndex(str(tmp_path / "index"), 2, _identity())
++    with pytest.raises(ValueError, match="block hash length"):
++        index.commit({1: b"x" * 81})
++    with pytest.raises(IndexError, match="slot out of range"):
++        index.invalidate([2])
++    index.close()
++
++
++def test_clear_durably_invalidates_every_slot(tmp_path) -> None:
++    path = tmp_path / "index"
++    index = SchedulerSlotIndex(str(path), 3, _identity())
++    index.commit({1: b"a" * 36, 2: b"b" * 36})
++    index.clear()
++    index.close()
++
++    reopened = SchedulerSlotIndex(str(path), 3, _identity())
++    assert reopened.load() == {}
++    reopened.close()
++
++
++def test_six_step_commit_protocol_publishes_only_after_rank_durability(
++    tmp_path,
++) -> None:
++    index_path = tmp_path / "cache.index"
++    rank0_path = tmp_path / "cache.rank_0.meta"
++    rank1_path = tmp_path / "cache.rank_1.meta"
++    index_identity = _identity(rank="scheduler")
++    rank0 = RankSlotManifest(str(rank0_path), 3, _identity(rank=0))
++    rank1 = RankSlotManifest(str(rank1_path), 3, _identity(rank=1))
++    index = SchedulerSlotIndex(str(index_path), 3, index_identity)
++
++    old_hash = b"o" * 36
++    index.commit({1: old_hash})
++    rank0.commit({1: 10})
++    rank1.commit({1: 20})
++
++    # Step 1: scheduler invalidates before either worker may overwrite data.
++    index.invalidate([1])
++    index.close()
++    index = SchedulerSlotIndex(str(index_path), 3, index_identity)
++    assert index.load() == {}
++
++    # Steps 2 and 3: rank validity is cleared before packed rows are written.
++    rank0.invalidate([1])
++    rank1.invalidate([1])
++    assert rank0.load()[1] is None
++    assert rank1.load()[1] is None
++    assert index.load() == {}
++
++    # Steps 4 and 5: both durable rank records still do not publish the hash.
++    rank0.commit({1: 30})
++    rank1.commit({1: 40})
++    assert rank0.load()[1] == 30
++    assert rank1.load()[1] == 40
++    assert index.load() == {}
++
++    # Step 6 is the sole durable visibility point.
++    new_hash = b"n" * 36
++    index.commit({1: new_hash})
++    index.close()
++    reopened = SchedulerSlotIndex(str(index_path), 3, index_identity)
++    assert reopened.load() == {1: new_hash}
++    reopened.close()
++    rank0.close()
++    rank1.close()
++
++
++def test_short_metadata_io_is_completed_and_sync_failure_propagates(
++    tmp_path, monkeypatch
++) -> None:
++    path = tmp_path / "index"
++    index = SchedulerSlotIndex(str(path), 3, _identity())
++    real_pwrite = os.pwrite
++    real_pread = os.pread
++
++    def short_pwrite(fd: int, data, offset: int) -> int:
++        return real_pwrite(fd, data[:3], offset)
++
++    def short_pread(fd: int, size: int, offset: int) -> bytes:
++        return real_pread(fd, min(size, 3), offset)
++
++    monkeypatch.setattr(os, "pwrite", short_pwrite)
++    index.commit({1: b"h" * 36, 2: b"i" * 36})
++    monkeypatch.setattr(os, "pread", short_pread)
++    assert index.load() == {1: b"h" * 36, 2: b"i" * 36}
++
++    def fail_sync(_fd: int) -> None:
++        raise OSError("simulated fdatasync failure")
++
++    monkeypatch.setattr(os, "fdatasync", fail_sync)
++    with pytest.raises(OSError, match="simulated fdatasync failure"):
++        index.invalidate([1])
++    index.close()
++
++
++def test_metadata_size_is_fixed_and_duplicate_hashes_are_bounded(tmp_path) -> None:
++    path = tmp_path / "index"
++    index = SchedulerSlotIndex(str(path), 100, _identity())
++    duplicate = b"d" * 36
++    index.commit({1: duplicate, 99: duplicate})
++    assert index.load() == {1: duplicate, 99: duplicate}
++    index.close()
++    assert path.stat().st_size == 4096 + 100 * 96
+diff --git a/tests/v1/simple_kv_offload/test_scheduler.py b/tests/v1/simple_kv_offload/test_scheduler.py
+index fa55ea4a7..dcbf412b8 100644
+--- a/tests/v1/simple_kv_offload/test_scheduler.py
++++ b/tests/v1/simple_kv_offload/test_scheduler.py
+@@ -152,6 +152,7 @@ def make_scheduler(
+     num_groups: int = 1,
+     lazy: bool = False,
+     max_store_blocks_per_event: int = 0,
++    persistent_path: str | None = None,
+ ) -> SchedulerFixture:
+     """Build a SimpleCPUOffloadScheduler with small block pools."""
+     kv_cache_config = _make_kv_cache_config(num_gpu_blocks, num_groups)
+@@ -166,6 +167,11 @@ def make_scheduler(
+         hash_block_size=BLOCK_SIZE,
+         lazy_offload=lazy,
+         max_store_blocks_per_event=max_store_blocks_per_event,
++        disk_path=persistent_path,
++        disk_persistence=persistent_path is not None,
++        disk_cache_identity=(
++            "scheduler-unit-test" if persistent_path is not None else None
++        ),
+     )
+ 
+     # Build a real GPU block pool and bind it
+@@ -1893,3 +1899,94 @@ def test_cp_lazy_target_blocks_scaling(cp_world_size: int) -> None:
+             f"cp_world_size={cp_world_size}: target_cp={target_cp} should be "
+             f"less than target_base={target_base}"
+         )
++
++
++def test_persistent_scheduler_index_reopens_committed_slots(
++    tmp_path, monkeypatch
++) -> None:
++    monkeypatch.setenv("PYTHONHASHSEED", "0")
++    path = str(tmp_path / "cache")
++    first = make_scheduler(
++        num_cpu_blocks=4,
++        num_gpu_blocks=8,
++        persistent_path=path,
++    )
++    request = make_request(num_blocks=2)
++    blocks = _alloc_and_register(first, request, 2)
++    first.scheduler.update_state_after_alloc(request, blocks, 0)
++    meta = first.scheduler.build_connector_meta(
++        make_scheduler_output(
++            {request.request_id: 2 * BLOCK_SIZE},
++            new_reqs={request.request_id: blocks.get_block_ids()},
++        )
++    )
++    simulate_store_completion(first.scheduler, meta.store_event)
++    assert first.scheduler._persistent_index is not None
++    first.scheduler._persistent_index.close()
++
++    reopened = make_scheduler(
++        num_cpu_blocks=4,
++        num_gpu_blocks=8,
++        persistent_path=path,
++    )
++    for block_hash in request.block_hashes[:2]:
++        key = make_block_hash_with_group_id(block_hash, 0)
++        assert (
++            reopened.scheduler.cpu_block_pool.cached_block_hash_to_block.get_one_block(
++                key
++            )
++            is not None
++        )
++    assert reopened.scheduler._persistent_index is not None
++    reopened.scheduler._persistent_index.close()
++
++
++def test_persistent_slot_is_invalid_before_worker_overwrite(
++    tmp_path, monkeypatch
++) -> None:
++    monkeypatch.setenv("PYTHONHASHSEED", "0")
++    path = str(tmp_path / "cache")
++    first = make_scheduler(
++        num_cpu_blocks=3,
++        num_gpu_blocks=8,
++        persistent_path=path,
++    )
++    request_a = make_request(num_blocks=2)
++    blocks_a = _alloc_and_register(first, request_a, 2)
++    first.scheduler.update_state_after_alloc(request_a, blocks_a, 0)
++    meta_a = first.scheduler.build_connector_meta(
++        make_scheduler_output(
++            {request_a.request_id: 2 * BLOCK_SIZE},
++            new_reqs={request_a.request_id: blocks_a.get_block_ids()},
++        )
++    )
++    simulate_store_completion(first.scheduler, meta_a.store_event)
++
++    request_b = make_request(num_blocks=1)
++    blocks_b = _alloc_and_register(first, request_b, 1)
++    first.scheduler.update_state_after_alloc(request_b, blocks_b, 0)
++    meta_b = first.scheduler.build_connector_meta(
++        make_scheduler_output(
++            {request_b.request_id: BLOCK_SIZE},
++            new_reqs={request_b.request_id: blocks_b.get_block_ids()},
++        )
++    )
++    overwritten_slot = meta_b.store_cpu_blocks[0]
++    assert first.scheduler._persistent_index is not None
++    assert overwritten_slot not in first.scheduler._persistent_index.load()
++    first.scheduler._persistent_index.close()
++
++    reopened = make_scheduler(
++        num_cpu_blocks=3,
++        num_gpu_blocks=8,
++        persistent_path=path,
++    )
++    evicted_key = make_block_hash_with_group_id(request_a.block_hashes[0], 0)
++    assert (
++        reopened.scheduler.cpu_block_pool.cached_block_hash_to_block.get_one_block(
++            evicted_key
++        )
++        is None
++    )
++    assert reopened.scheduler._persistent_index is not None
++    reopened.scheduler._persistent_index.close()
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
+index 50b65b008..fc696b4ba 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
+@@ -53,6 +53,8 @@ _DISK_ONLY_KEYS = (
+     "disk_queue_depth",
+     "disk_enqueue_timeout_s",
+     "disk_max_store_blocks",
++    "disk_persistence",
++    "disk_cache_identity",
+ )
+ 
+ 
+@@ -106,10 +108,10 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
+         use_page_cache = extra_config.get("use_page_cache", False)
+         preallocate_disk = extra_config.get("preallocate_disk", True)
+         disk_queue_depth = int(extra_config.get("disk_queue_depth", 2))
+-        disk_enqueue_timeout_s = float(
+-            extra_config.get("disk_enqueue_timeout_s", 30.0)
+-        )
++        disk_enqueue_timeout_s = float(extra_config.get("disk_enqueue_timeout_s", 30.0))
+         disk_max_store_blocks = int(extra_config.get("disk_max_store_blocks", 64))
++        disk_persistence = extra_config.get("disk_persistence", False)
++        disk_cache_identity = extra_config.get("disk_cache_identity", None)
+ 
+         if disk_mode:
+             if not isinstance(disk_path, str) or not disk_path:
+@@ -133,8 +135,29 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
+                     "disk_enqueue_timeout_s must be greater than 0 and at most 300"
+                 )
+             if not 1 <= disk_max_store_blocks <= 4096:
+-                raise ValueError(
+-                    "disk_max_store_blocks must be between 1 and 4096"
++                raise ValueError("disk_max_store_blocks must be between 1 and 4096")
++            if not isinstance(disk_persistence, bool):
++                raise ValueError("disk_persistence must be a boolean")
++            if disk_persistence:
++                if (
++                    not isinstance(disk_cache_identity, str)
++                    or not disk_cache_identity
++                    or len(disk_cache_identity) > 256
++                    or not disk_cache_identity.isascii()
++                ):
++                    raise ValueError(
++                        "persistent disk mode requires a non-empty ASCII "
++                        "disk_cache_identity of at most 256 characters"
++                    )
++                hash_seed = os.environ.get("PYTHONHASHSEED")
++                if hash_seed is None or hash_seed.lower() == "random":
++                    raise ValueError(
++                        "persistent disk mode requires a fixed PYTHONHASHSEED"
++                    )
++            elif disk_cache_identity is not None:
++                logger.warning(
++                    "disk_cache_identity is ignored because disk_persistence "
++                    "is disabled"
+                 )
+         else:
+             ignored = [k for k in _DISK_ONLY_KEYS if k in extra_config]
+@@ -182,9 +205,10 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
+                 hash_block_size=hash_block_size,
+                 lazy_offload=lazy_offload,
+                 disk_capacity_bytes=disk_capacity_bytes if disk_mode else 0,
+-                max_store_blocks_per_event=(
+-                    disk_max_store_blocks if disk_mode else 0
+-                ),
++                max_store_blocks_per_event=(disk_max_store_blocks if disk_mode else 0),
++                disk_path=disk_path,
++                disk_persistence=disk_persistence,
++                disk_cache_identity=disk_cache_identity,
+             )
+         elif role == KVConnectorRole.WORKER:
+             self.worker_handler = SimpleCPUOffloadWorker(
+@@ -199,6 +223,8 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
+                 preallocate_disk=preallocate_disk,
+                 disk_queue_depth=disk_queue_depth,
+                 disk_enqueue_timeout_s=disk_enqueue_timeout_s,
++                disk_persistence=disk_persistence,
++                disk_cache_identity=disk_cache_identity,
+             )
+ 
+     # --- Worker-side methods ---
+diff --git a/vllm/v1/simple_kv_offload/disk_backend.py b/vllm/v1/simple_kv_offload/disk_backend.py
+index 2eefa4dfb..8d6348e58 100644
+--- a/vllm/v1/simple_kv_offload/disk_backend.py
++++ b/vllm/v1/simple_kv_offload/disk_backend.py
+@@ -14,6 +14,7 @@ import os
+ import queue
+ import threading
+ import zlib
++from collections.abc import Mapping
+ 
+ import torch
+ 
+@@ -27,6 +28,10 @@ from vllm.v1.simple_kv_offload.cuda_mem_ops import (
+     copy_blocks,
+     pin_tensor,
+ )
++from vllm.v1.simple_kv_offload.persistent_metadata import (
++    RankSlotManifest,
++    validate_private_regular_fd,
++)
+ 
+ logger = init_logger(__name__)
+ 
+@@ -89,6 +94,8 @@ class DiskBackend:
+         self._per_tensor_bpb: list[int] = []
+         self._tensor_names: list[str] = []
+         self._slot_checksums: list[int | None] = []
++        self._persistent: bool = False
++        self._manifest: RankSlotManifest | None = None
+         self._failure_lock = threading.Lock()
+         self._failure: RuntimeError | None = None
+ 
+@@ -106,6 +113,8 @@ class DiskBackend:
+         preallocate_disk: bool = True,
+         queue_depth: int = 2,
+         enqueue_timeout_s: float = 30.0,
++        persistent: bool = False,
++        persistent_identity: Mapping[str, object] | None = None,
+     ) -> None:
+         self._load_stream = load_stream
+         self._store_stream = store_stream
+@@ -118,6 +127,9 @@ class DiskBackend:
+         self._store_queue = queue.Queue(maxsize=queue_depth)
+         self._load_queue = queue.Queue(maxsize=queue_depth)
+         self._enqueue_timeout_s = enqueue_timeout_s
++        self._persistent = persistent
++        if persistent and persistent_identity is None:
++            raise ValueError("persistent disk mode requires an identity")
+         self._tensor_names = list(gpu_caches.keys())
+         self._per_tensor_bpb = [
+             t.stride(0) * t.element_size() for t in gpu_caches.values()
+@@ -138,15 +150,11 @@ class DiskBackend:
+ 
+         # Pre-built iovec views per slot (avoid per-transfer .numpy() calls)
+         self._store_slot_views = [
+-            [
+-                memoryview(self._store_raw[slot].numpy())
+-            ]
++            [memoryview(self._store_raw[slot].numpy())]
+             for slot in range(num_buffer_slots)
+         ]
+         self._load_slot_views = [
+-            [
+-                memoryview(self._load_raw[slot].numpy())
+-            ]
++            [memoryview(self._load_raw[slot].numpy())]
+             for slot in range(num_buffer_slots)
+         ]
+ 
+@@ -164,14 +172,24 @@ class DiskBackend:
+         )
+ 
+         os.makedirs(os.path.dirname(disk_path) or ".", exist_ok=True)
+-        # Slot contents never outlive the process, so unlink then O_EXCL rather
+-        # than reopening: a pre-existing file would otherwise keep its own
+-        # (possibly world-readable) mode, and blocks may encode user prompts.
+-        with contextlib.suppress(FileNotFoundError):
+-            os.unlink(disk_path)
++        manifest_path = f"{disk_path}.meta"
++        data_existed = os.path.lexists(disk_path)
++        manifest_existed = os.path.lexists(manifest_path)
++        if persistent and data_existed != manifest_existed:
++            raise ValueError(
++                "persistent KV data/manifest presence mismatch; "
++                "purge the exact cache namespace before reinitializing"
++            )
++        if not persistent:
++            # Process-lifetime rows can encode user prompts.  Unlink then use
++            # O_EXCL so an old file cannot retain unsafe mode or stale bytes.
++            with contextlib.suppress(FileNotFoundError):
++                os.unlink(disk_path)
+         # O_DIRECT by default: page cache would consume the very host DRAM this
+         # backend exists to conserve, and doubles the copy on the store path.
+-        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
++        flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
++        if not persistent:
++            flags |= os.O_EXCL
+         if not use_page_cache:
+             if O_DIRECT == 0:
+                 raise RuntimeError("O_DIRECT is unavailable on this platform")
+@@ -180,20 +198,47 @@ class DiskBackend:
+         self._disk_path = disk_path
+         allocation_bytes = num_disk_slots * self._disk_slot_bytes
+         try:
+-            os.ftruncate(self._fd, allocation_bytes)
+-            if preallocate_disk:
+-                os.posix_fallocate(self._fd, 0, allocation_bytes)
++            st = validate_private_regular_fd(self._fd, disk_path)
++            if st.st_size == 0:
++                if persistent and data_existed:
++                    raise ValueError(
++                        f"persistent KV data is unexpectedly empty: {disk_path}"
++                    )
++                os.ftruncate(self._fd, allocation_bytes)
++                if preallocate_disk:
++                    os.posix_fallocate(self._fd, 0, allocation_bytes)
++                os.fdatasync(self._fd)
++            elif not persistent or st.st_size != allocation_bytes:
++                raise ValueError(
++                    f"persistent KV data size mismatch for {disk_path}: "
++                    f"expected={allocation_bytes}, actual={st.st_size}"
++                )
++            if persistent:
++                assert persistent_identity is not None
++                self._manifest = RankSlotManifest(
++                    manifest_path,
++                    num_disk_slots,
++                    persistent_identity,
++                )
++                self._slot_checksums = self._manifest.load()
+         except BaseException:
++            if self._manifest is not None:
++                self._manifest.close()
++                self._manifest = None
+             os.close(self._fd)
+             self._fd = -1
+-            with contextlib.suppress(OSError):
+-                os.unlink(disk_path)
++            if not data_existed:
++                with contextlib.suppress(OSError):
++                    os.unlink(disk_path)
++            if not manifest_existed:
++                with contextlib.suppress(OSError):
++                    os.unlink(manifest_path)
+             raise
+ 
+         logger.info(
+             "DiskBackend: path=%s, slots=%d, total=%.2f GB, "
+             "payload=%d slot=%d bytes, buf=%d"
+-            " queue=%d timeout=%.1fs (page_cache=%s)",
++            " queue=%d timeout=%.1fs (page_cache=%s persistent=%s)",
+             disk_path,
+             num_disk_slots,
+             (num_disk_slots * self._disk_slot_bytes) / (1024**3),
+@@ -203,6 +248,7 @@ class DiskBackend:
+             queue_depth,
+             enqueue_timeout_s,
+             use_page_cache,
++            persistent,
+         )
+ 
+         self._store_thread = threading.Thread(
+@@ -218,9 +264,7 @@ class DiskBackend:
+         self._store_thread.start()
+         self._load_thread.start()
+ 
+-    def _build_payload_views(
+-        self, raw: torch.Tensor
+-    ) -> dict[str, torch.Tensor]:
++    def _build_payload_views(self, raw: torch.Tensor) -> dict[str, torch.Tensor]:
+         views: dict[str, torch.Tensor] = {}
+         offset = 0
+         for name, payload_bytes in zip(self._tensor_names, self._per_tensor_bpb):
+@@ -317,13 +361,11 @@ class DiskBackend:
+             self._load_thread.join(timeout=10.0)
+         if self._fd < 0:
+             return
+-        # Slot contents can encode user prompts, so drop the name now rather
+-        # than leaving them readable until the next run overwrites the file.
+-        # Unlinking only removes the directory entry: any thread still holding
+-        # the fd keeps writing to the (now anonymous) inode, which the kernel
+-        # frees once the last fd goes away.
+-        with contextlib.suppress(OSError):
+-            os.unlink(self._disk_path)
++        if not self._persistent:
++            # Unlinking only removes the directory entry: any thread still
++            # holding the fd keeps writing to the anonymous inode.
++            with contextlib.suppress(OSError):
++                os.unlink(self._disk_path)
+         # Closing under a still-running IO thread would let the fd number be
+         # reused by an unrelated open(), turning its next pwritev into a write
+         # into that file. Leaking one fd for the remaining process lifetime is
+@@ -339,6 +381,8 @@ class DiskBackend:
+             return
+         os.close(self._fd)
+         self._fd = -1
++        if self._manifest is not None:
++            self._manifest.close()
+ 
+     def _store_loop(
+         self,
+@@ -367,8 +411,7 @@ class DiskBackend:
+         written = os.pwritev(self._fd, self._store_slot_views[buf_slot], file_offset)
+         if written != self._disk_slot_bytes:
+             raise OSError(
+-                f"Short write: expected {self._disk_slot_bytes} bytes, "
+-                f"wrote {written}"
++                f"Short write: expected {self._disk_slot_bytes} bytes, wrote {written}"
+             )
+         self._slot_checksums[disk_slot] = zlib.crc32(
+             self._store_slot_views[buf_slot][0]
+@@ -379,8 +422,7 @@ class DiskBackend:
+         bytes_read = os.preadv(self._fd, self._load_slot_views[buf_slot], file_offset)
+         if bytes_read != self._disk_slot_bytes:
+             raise OSError(
+-                f"Short read: expected {self._disk_slot_bytes} bytes, "
+-                f"read {bytes_read}"
++                f"Short read: expected {self._disk_slot_bytes} bytes, read {bytes_read}"
+             )
+         expected = self._slot_checksums[disk_slot]
+         actual = zlib.crc32(self._load_slot_views[buf_slot][0])
+@@ -420,6 +462,8 @@ class DiskBackend:
+     ) -> None:
+         """GPU -> buffer (DMA) -> disk (pwritev), interleaved double-buffer."""
+         assert self._store_params is not None
++        if self._manifest is not None:
++            self._manifest.invalidate(disk_slots)
+         n = self._num_buffer_slots
+         # (DMA event, disk slot) of the block already staged in each buffer.
+         pending: list[tuple[torch.Event, int] | None] = [None] * n
+@@ -440,6 +484,17 @@ class DiskBackend:
+             if last is not None:
+                 last[0].synchronize()
+                 self._writev_slot(slot, last[1])
++        if self._manifest is not None:
++            os.fdatasync(self._fd)
++            checksums: dict[int, int] = {}
++            for slot in disk_slots:
++                checksum = self._slot_checksums[slot]
++                if checksum is None:
++                    raise RuntimeError(
++                        f"missing checksum after persistent KV store for slot {slot}"
++                    )
++                checksums[slot] = checksum
++            self._manifest.commit(checksums)
+ 
+     def _do_load(
+         self,
+diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/manager.py
+index ca75a3565..5e3398b34 100644
+--- a/vllm/v1/simple_kv_offload/manager.py
++++ b/vllm/v1/simple_kv_offload/manager.py
+@@ -3,6 +3,7 @@
+ """Scheduler-side manager for SimpleCPUOffloadConnector."""
+ 
+ import contextlib
++import os
+ from collections.abc import Iterable
+ from dataclasses import dataclass, field
+ from typing import TYPE_CHECKING, Any
+@@ -12,7 +13,6 @@ from vllm.distributed.kv_events import KVCacheEvent
+ from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
+ from vllm.logger import init_logger
+ from vllm.utils.math_utils import cdiv
+-from vllm.v1.simple_kv_offload.disk_backend import aligned_disk_slot_bytes
+ from vllm.v1.core.block_pool import BlockPool
+ from vllm.v1.core.kv_cache_coordinator import (
+     KVCacheCoordinator,
+@@ -25,10 +25,12 @@ from vllm.v1.kv_cache_interface import (
+     SlidingWindowSpec,
+ )
+ from vllm.v1.outputs import KVConnectorOutput
++from vllm.v1.simple_kv_offload.disk_backend import aligned_disk_slot_bytes
+ from vllm.v1.simple_kv_offload.metadata import (
+     SimpleCPUOffloadMetadata,
+     SimpleCPUOffloadWorkerMetadata,
+ )
++from vllm.v1.simple_kv_offload.persistent_metadata import SchedulerSlotIndex
+ 
+ if TYPE_CHECKING:
+     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+@@ -78,6 +80,9 @@ class SimpleCPUOffloadScheduler:
+         lazy_offload: bool = False,
+         disk_capacity_bytes: int = 0,
+         max_store_blocks_per_event: int = 0,
++        disk_path: str | None = None,
++        disk_persistence: bool = False,
++        disk_cache_identity: str | None = None,
+     ):
+         self.vllm_config = vllm_config
+         self.kv_cache_config = kv_cache_config
+@@ -147,6 +152,32 @@ class SimpleCPUOffloadScheduler:
+             hash_block_size=self.hash_block_size,
+         )
+         self.cpu_block_pool: BlockPool = self.cpu_coordinator.block_pool
++        self._persistent_index: SchedulerSlotIndex | None = None
++        if disk_persistence:
++            if not disk_path or not disk_cache_identity:
++                raise ValueError(
++                    "persistent disk mode requires disk_path and disk_cache_identity"
++                )
++            hash_seed = os.environ.get("PYTHONHASHSEED")
++            if hash_seed is None or hash_seed.lower() == "random":
++                raise ValueError("persistent disk mode requires a fixed PYTHONHASHSEED")
++            group_block_sizes = [
++                group.kv_cache_spec.block_size * self.cp_world_size
++                for group in self.cpu_kv_cache_config.kv_cache_groups
++            ]
++            self._persistent_index = SchedulerSlotIndex(
++                f"{disk_path}.index",
++                self.num_cpu_blocks,
++                {
++                    "cache_identity": disk_cache_identity,
++                    "group_block_sizes": group_block_sizes,
++                    "hash_block_size": self.hash_block_size,
++                    "python_hash_seed": hash_seed,
++                    "scheduler_block_size": self.block_size,
++                    "world_size": vllm_config.parallel_config.world_size,
++                },
++            )
++            self._restore_persistent_index()
+         # GPU block pool reference - bound after scheduler builds kv_cache_manager
+         self._gpu_block_pool: BlockPool | None = None
+ 
+@@ -191,6 +222,34 @@ class SimpleCPUOffloadScheduler:
+         self._expected_worker_count = vllm_config.parallel_config.world_size
+         self._store_event_pending_counts: dict[int, int] = {}
+ 
++    def _restore_persistent_index(self) -> None:
++        """Publish crash-committed disk slots into the offload block pool."""
++        from vllm.v1.core.kv_cache_utils import (
++            BlockHashWithGroupId,
++            get_group_id,
++        )
++
++        assert self._persistent_index is not None
++        mappings = self._persistent_index.load()
++        num_groups = len(self.cpu_kv_cache_config.kv_cache_groups)
++        for slot, raw_hash in mappings.items():
++            block = self.cpu_block_pool.blocks[slot]
++            if block.is_null:
++                raise ValueError("persistent KV index references the null block")
++            if len(raw_hash) <= 4:
++                raise ValueError(f"persistent KV hash is too short at slot {slot}")
++            block_hash = BlockHashWithGroupId(raw_hash)
++            group_id = get_group_id(block_hash)
++            if not 0 <= group_id < num_groups:
++                raise ValueError(
++                    "persistent KV index has an invalid group id "
++                    f"at slot {slot}: {group_id}"
++                )
++            block.set_block_hash(block_hash)
++            self.cpu_block_pool.cached_block_hash_to_block.insert(block_hash, block)
++        if mappings:
++            logger.info("Restored %d committed persistent KV slots", len(mappings))
++
+     @staticmethod
+     def _derive_cpu_config(
+         gpu_config: "KVCacheConfig",
+@@ -559,6 +618,8 @@ class SimpleCPUOffloadScheduler:
+         if gpu_ids:
+             cpu_blocks = cpu_pool.get_new_blocks(len(gpu_ids))
+             cpu_ids = [blk.block_id for blk in cpu_blocks]
++            if self._persistent_index is not None:
++                self._persistent_index.invalidate(cpu_ids)
+             for cpu_blk, bhash in zip(cpu_blocks, block_hashes):  # type: ignore[assignment]
+                 cpu_blk._block_hash = bhash  # type: ignore[assignment]
+             # Touch GPU blocks to prevent eviction during async copy.
+@@ -693,6 +754,8 @@ class SimpleCPUOffloadScheduler:
+             if n_to_alloc > 0:
+                 cpu_blocks_alloc = cpu_block_pool.get_new_blocks(n_to_alloc)
+                 cpu_block_ids = [blk.block_id for blk in cpu_blocks_alloc]
++                if self._persistent_index is not None:
++                    self._persistent_index.invalidate(cpu_block_ids)
+                 for cpu_blk, bhash in zip(cpu_blocks_alloc, block_hashes_to_store):
+                     cpu_blk._block_hash = bhash  # type: ignore[assignment]
+             else:
+@@ -792,6 +855,16 @@ class SimpleCPUOffloadScheduler:
+ 
+         cpu_blocks = [self.cpu_block_pool.blocks[bid] for bid in cpu_block_ids]
+ 
++        if self._persistent_index is not None:
++            mappings: dict[int, bytes] = {}
++            for block in cpu_blocks:
++                if block.block_hash is None:
++                    raise RuntimeError(
++                        "persistent KV store completed without a block hash"
++                    )
++                mappings[block.block_id] = bytes(block.block_hash)
++            self._persistent_index.commit(mappings)
++
+         for cpu_block in cpu_blocks:
+             bhash = cpu_block.block_hash
+             assert bhash is not None
+@@ -963,4 +1036,13 @@ class SimpleCPUOffloadScheduler:
+         if self._abandoned_store_event_to_blocks or self._abandoned_reqs_to_load:
+             return False
+ 
++        if self._persistent_index is not None:
++            num_used = (
++                self.cpu_block_pool.num_gpu_blocks
++                - self.cpu_block_pool.get_num_free_blocks()
++            )
++            if num_used != 1:
++                return False
++            self._persistent_index.clear()
++
+         return self.cpu_block_pool.reset_prefix_cache()
+diff --git a/vllm/v1/simple_kv_offload/persistent_metadata.py b/vllm/v1/simple_kv_offload/persistent_metadata.py
+new file mode 100644
+index 000000000..5771006d1
+--- /dev/null
++++ b/vllm/v1/simple_kv_offload/persistent_metadata.py
+@@ -0,0 +1,262 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Crash-safe fixed-record metadata for persistent disk KV slots."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import stat
++import struct
++import zlib
++from collections.abc import Iterable, Mapping
++
++_HEADER_SIZE = 4096
++_HEADER_PREFIX = struct.Struct(">8sII32s")
++_MAGIC = b"VKVPM001"
++_VERSION = 1
++_RANK_RECORD = struct.Struct(">B3xII4x")
++_INDEX_HASH_BYTES = 80
++_INDEX_RECORD = struct.Struct(f">BB2x{_INDEX_HASH_BYTES}sI8x")
++
++
++def _pwrite_all(fd: int, data: bytes, offset: int) -> None:
++    view = memoryview(data)
++    written = 0
++    while written < len(view):
++        n = os.pwrite(fd, view[written:], offset + written)
++        if n <= 0:
++            raise OSError("short metadata write")
++        written += n
++
++
++def _pread_exact(fd: int, size: int, offset: int) -> bytes:
++    chunks: list[bytes] = []
++    read = 0
++    while read < size:
++        chunk = os.pread(fd, size - read, offset + read)
++        if not chunk:
++            raise OSError(f"short metadata read: expected={size}, read={read}")
++        chunks.append(chunk)
++        read += len(chunk)
++    return b"".join(chunks)
++
++
++def validate_private_regular_fd(fd: int, path: str) -> os.stat_result:
++    """Reject cache files that can expose or redirect prompt-derived data."""
++    st = os.fstat(fd)
++    if not stat.S_ISREG(st.st_mode):
++        raise ValueError(f"KV cache path is not a regular file: {path}")
++    if st.st_uid != os.geteuid():
++        raise PermissionError(f"KV cache path is not owned by this user: {path}")
++    if stat.S_IMODE(st.st_mode) != 0o600:
++        raise PermissionError(f"KV cache path must have mode 0600: {path}")
++    if st.st_nlink != 1:
++        raise PermissionError(f"KV cache path must not have hard links: {path}")
++    return st
++
++
++def _header_bytes(
++    kind: str,
++    num_slots: int,
++    record_size: int,
++    identity: Mapping[str, object],
++) -> bytes:
++    document = {
++        "identity": dict(identity),
++        "kind": kind,
++        "num_slots": num_slots,
++        "record_size": record_size,
++        "version": _VERSION,
++    }
++    payload = json.dumps(
++        document,
++        ensure_ascii=True,
++        separators=(",", ":"),
++        sort_keys=True,
++    ).encode("ascii")
++    if len(payload) > _HEADER_SIZE - _HEADER_PREFIX.size:
++        raise ValueError("persistent KV identity is too large")
++    digest = hashlib.sha256(payload).digest()
++    prefix = _HEADER_PREFIX.pack(_MAGIC, _VERSION, len(payload), digest)
++    return (prefix + payload).ljust(_HEADER_SIZE, b"\0")
++
++
++class _FixedRecordFile:
++    def __init__(
++        self,
++        path: str,
++        kind: str,
++        num_slots: int,
++        record_size: int,
++        identity: Mapping[str, object],
++    ) -> None:
++        if num_slots < 1:
++            raise ValueError("persistent KV metadata requires at least one slot")
++        flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
++        flags |= getattr(os, "O_CLOEXEC", 0)
++        fd = os.open(path, flags, 0o600)
++        try:
++            st = validate_private_regular_fd(fd, path)
++            expected_header = _header_bytes(kind, num_slots, record_size, identity)
++            expected_size = _HEADER_SIZE + num_slots * record_size
++            if st.st_size == 0:
++                os.ftruncate(fd, expected_size)
++                _pwrite_all(fd, expected_header, 0)
++                os.fdatasync(fd)
++            elif st.st_size != expected_size:
++                raise ValueError(
++                    f"persistent KV metadata size mismatch for {path}: "
++                    f"expected={expected_size}, actual={st.st_size}"
++                )
++            elif _pread_exact(fd, _HEADER_SIZE, 0) != expected_header:
++                raise ValueError(f"persistent KV metadata identity mismatch for {path}")
++        except BaseException:
++            os.close(fd)
++            raise
++        self.path = path
++        self.num_slots = num_slots
++        self.record_size = record_size
++        self.fd = fd
++
++    def _offset(self, slot: int) -> int:
++        if not 0 <= slot < self.num_slots:
++            raise IndexError(f"persistent KV slot out of range: {slot}")
++        return _HEADER_SIZE + slot * self.record_size
++
++    def invalidate(self, slots: Iterable[int]) -> None:
++        changed = False
++        empty = b"\0" * self.record_size
++        for slot in dict.fromkeys(slots):
++            _pwrite_all(self.fd, empty, self._offset(slot))
++            changed = True
++        if changed:
++            os.fdatasync(self.fd)
++
++    def clear(self) -> None:
++        """Durably invalidate every slot in the metadata file."""
++        empty = b"\0" * (self.num_slots * self.record_size)
++        _pwrite_all(self.fd, empty, _HEADER_SIZE)
++        os.fdatasync(self.fd)
++
++    def _records(self) -> bytes:
++        return _pread_exact(
++            self.fd,
++            self.num_slots * self.record_size,
++            _HEADER_SIZE,
++        )
++
++    def close(self) -> None:
++        if self.fd >= 0:
++            os.close(self.fd)
++            self.fd = -1
++
++
++def _record_crc(slot: int, body: bytes) -> int:
++    return zlib.crc32(slot.to_bytes(8, "big") + body)
++
++
++class RankSlotManifest(_FixedRecordFile):
++    """Durable per-rank checksum and validity records."""
++
++    def __init__(
++        self,
++        path: str,
++        num_slots: int,
++        identity: Mapping[str, object],
++    ) -> None:
++        super().__init__(
++            path,
++            "rank-manifest",
++            num_slots,
++            _RANK_RECORD.size,
++            identity,
++        )
++
++    def commit(self, checksums: Mapping[int, int]) -> None:
++        for slot, checksum in checksums.items():
++            if not 0 <= checksum <= 0xFFFFFFFF:
++                raise ValueError(f"invalid CRC32 for slot {slot}: {checksum}")
++            body = struct.pack(">B3xI", 1, checksum)
++            record = _RANK_RECORD.pack(
++                1,
++                checksum,
++                _record_crc(slot, body),
++            )
++            _pwrite_all(self.fd, record, self._offset(slot))
++        if checksums:
++            os.fdatasync(self.fd)
++
++    def load(self) -> list[int | None]:
++        raw = self._records()
++        checksums: list[int | None] = [None] * self.num_slots
++        empty = b"\0" * self.record_size
++        for slot in range(self.num_slots):
++            start = slot * self.record_size
++            record = raw[start : start + self.record_size]
++            if record == empty:
++                continue
++            state, checksum, expected_crc = _RANK_RECORD.unpack(record)
++            body = struct.pack(">B3xI", state, checksum)
++            if state != 1 or _record_crc(slot, body) != expected_crc:
++                raise ValueError(f"corrupt persistent rank record at slot {slot}")
++            checksums[slot] = checksum
++        return checksums
++
++
++class SchedulerSlotIndex(_FixedRecordFile):
++    """Durable scheduler authority for committed hash-to-slot mappings."""
++
++    def __init__(
++        self,
++        path: str,
++        num_slots: int,
++        identity: Mapping[str, object],
++    ) -> None:
++        super().__init__(
++            path,
++            "scheduler-index",
++            num_slots,
++            _INDEX_RECORD.size,
++            identity,
++        )
++
++    def commit(self, mappings: Mapping[int, bytes]) -> None:
++        for slot, block_hash in mappings.items():
++            if not block_hash or len(block_hash) > _INDEX_HASH_BYTES:
++                raise ValueError(
++                    f"invalid persistent block hash length at slot {slot}: "
++                    f"{len(block_hash)}"
++                )
++            padded = block_hash.ljust(_INDEX_HASH_BYTES, b"\0")
++            body = struct.pack(">BB2x", 1, len(block_hash)) + padded
++            record = _INDEX_RECORD.pack(
++                1,
++                len(block_hash),
++                padded,
++                _record_crc(slot, body),
++            )
++            _pwrite_all(self.fd, record, self._offset(slot))
++        if mappings:
++            os.fdatasync(self.fd)
++
++    def load(self) -> dict[int, bytes]:
++        raw = self._records()
++        mappings: dict[int, bytes] = {}
++        empty = b"\0" * self.record_size
++        for slot in range(self.num_slots):
++            start = slot * self.record_size
++            record = raw[start : start + self.record_size]
++            if record == empty:
++                continue
++            state, length, padded, expected_crc = _INDEX_RECORD.unpack(record)
++            body = struct.pack(">BB2x", state, length) + padded
++            if (
++                state != 1
++                or not 0 < length <= _INDEX_HASH_BYTES
++                or _record_crc(slot, body) != expected_crc
++            ):
++                raise ValueError(f"corrupt persistent scheduler record at slot {slot}")
++            mappings[slot] = padded[:length]
++        return mappings
+diff --git a/vllm/v1/simple_kv_offload/worker.py b/vllm/v1/simple_kv_offload/worker.py
+index e247c8bbf..34d7a3b5b 100644
+--- a/vllm/v1/simple_kv_offload/worker.py
++++ b/vllm/v1/simple_kv_offload/worker.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Worker-side handler for SimpleCPUOffloadConnector."""
+ 
++import os
+ from typing import TYPE_CHECKING
+ 
+ import torch
+@@ -42,6 +43,8 @@ class SimpleCPUOffloadWorker:
+         preallocate_disk: bool = True,
+         disk_queue_depth: int = 2,
+         disk_enqueue_timeout_s: float = 30.0,
++        disk_persistence: bool = False,
++        disk_cache_identity: str | None = None,
+     ):
+         self.vllm_config = vllm_config
+         self.kv_cache_config = kv_cache_config
+@@ -53,6 +56,8 @@ class SimpleCPUOffloadWorker:
+         self.preallocate_disk = preallocate_disk
+         self.disk_queue_depth = disk_queue_depth
+         self.disk_enqueue_timeout_s = disk_enqueue_timeout_s
++        self.disk_persistence = disk_persistence
++        self.disk_cache_identity = disk_cache_identity
+         self.disk_mode = kv_offload_backend == "disk"
+ 
+         self.gpu_kv_caches: dict[str, torch.Tensor] | None = None
+@@ -207,6 +212,18 @@ class SimpleCPUOffloadWorker:
+         assert self.disk_path is not None
+         rank = self.vllm_config.parallel_config.rank
+         rank_path = f"{self.disk_path}.rank_{rank}"
++        persistent_identity = {
++            "cache_identity": self.disk_cache_identity,
++            "payload_bytes": total_bytes_per_block,
++            "python_hash_seed": os.environ.get("PYTHONHASHSEED"),
++            "rank": rank,
++            "slot_bytes": disk_slot_bytes,
++            "tensor_bytes": [
++                [name, tensor.stride(0) * tensor.element_size()]
++                for name, tensor in unique_gpu_caches.items()
++            ],
++            "world_size": self.vllm_config.parallel_config.world_size,
++        }
+         self._backend = DiskBackend()
+         self._backend.init(
+             unique_gpu_caches,
+@@ -221,6 +238,8 @@ class SimpleCPUOffloadWorker:
+             self.preallocate_disk,
+             self.disk_queue_depth,
+             self.disk_enqueue_timeout_s,
++            self.disk_persistence,
++            persistent_identity,
+         )
+ 
+     def shutdown(self) -> None:
