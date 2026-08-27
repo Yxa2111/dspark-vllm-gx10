@@ -1,0 +1,65 @@
+diff --git a/tests/v1/simple_kv_offload/test_disk_backend.py b/tests/v1/simple_kv_offload/test_disk_backend.py
+index 7b6916da0..7b4ac80ba 100644
+--- a/tests/v1/simple_kv_offload/test_disk_backend.py
++++ b/tests/v1/simple_kv_offload/test_disk_backend.py
+@@ -4,6 +4,7 @@
+ 
+ from __future__ import annotations
+ 
++import errno
+ import os
+ import queue
+ from types import SimpleNamespace
+@@ -12,6 +13,7 @@ import pytest
+ import torch
+ 
+ from vllm.v1.simple_kv_offload import cuda_mem_ops
++from vllm.v1.simple_kv_offload import disk_backend as disk_backend_module
+ from vllm.v1.simple_kv_offload.disk_backend import (
+     DiskBackend,
+     _alloc_aligned,
+@@ -97,6 +99,44 @@ def test_background_failure_is_raised_on_engine_thread() -> None:
+         backend.raise_if_failed()
+ 
+ 
++def test_preallocation_enospc_closes_and_unlinks(
++    tmp_path, monkeypatch
++) -> None:
++    monkeypatch.setattr(disk_backend_module, "pin_tensor", lambda _tensor: None)
++    monkeypatch.setattr(
++        disk_backend_module,
++        "build_params",
++        lambda *_args, **_kwargs: object(),
++    )
++
++    def fail_fallocate(_fd: int, _offset: int, _length: int) -> None:
++        raise OSError(errno.ENOSPC, "simulated no space")
++
++    monkeypatch.setattr(os, "posix_fallocate", fail_fallocate)
++    backend = DiskBackend()
++    path = tmp_path / "preallocate-failure.slots"
++    gpu_caches = {"kv": torch.zeros((2, 4096), dtype=torch.int8)}
++
++    with pytest.raises(OSError) as error:
++        backend.init(
++            gpu_caches,
++            torch.device("cpu"),
++            SimpleNamespace(cuda_stream=1),
++            SimpleNamespace(cuda_stream=2),
++            str(path),
++            num_disk_slots=2,
++            total_block_bytes=4096,
++            use_page_cache=True,
++            preallocate_disk=True,
++        )
++
++    assert error.value.errno == errno.ENOSPC
++    assert backend._fd == -1
++    assert not path.exists()
++    assert backend._store_thread is None
++    assert backend._load_thread is None
++
++
+ def test_batch_copy_uses_independent_row_strides(monkeypatch) -> None:
+     monkeypatch.setattr(cuda_mem_ops, "_batch_memcpy_fn", object())
+     src = {"kv": torch.zeros((2, 3), dtype=torch.int8)}
