@@ -2,8 +2,9 @@
 
 Date: 2026-08-27
 
-State: bounded-work implementation complete; live two-node acceptance remains
-blocked until the head node returns and the Step 05 failure is diagnosed.
+State: bounded-work implementation and offline gates complete. The recovered
+head postmortem and revised live gates continue in
+[`STEP-07-LIVE-POSTMORTEM.md`](STEP-07-LIVE-POSTMORTEM.md).
 
 ## Gap found after Step 05
 
@@ -119,7 +120,8 @@ change the release-image runtime bytes.
 The default remains disabled. This step removes an unbounded resource path but
 does not replace the missing live gates:
 
-1. collect and explain the head's previous-boot failure evidence;
+1. apply the measured host UMA reserve and exact-project circuit breaker from
+   Step 07;
 2. build the same exact image independently on the recovered head and compare
    installed source hashes;
 3. prove a real disk load under a lower-memory isolated profile;
