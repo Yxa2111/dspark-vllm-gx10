@@ -1,0 +1,293 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+index bbac7854f..8f6531aba 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -44,11 +44,11 @@ from vllm.v1.kv_offload.base import (
+     RequestOffloadingContext,
+     ScheduleEndContext,
+     make_offload_key,
+ )
+ from vllm.v1.outputs import KVConnectorOutput
+-from vllm.v1.request import Request
++from vllm.v1.request import Request, RequestStatus
+
+ logger = init_logger(__name__)
+
+
+ @dataclass(slots=True)
+@@ -303,16 +303,41 @@ class RequestOffloadState:
+
+         assert len(new_block_id_groups) == len(self.group_states)
+         for group_state, new_blocks in zip(self.group_states, new_block_id_groups):
+             group_state.block_ids.extend(new_blocks)
+
++    def storable_blocks(
++        self,
++        group_config: GroupOffloadConfig,
++        group_state: RequestGroupState,
++        num_offloadable_tokens: int,
++    ) -> int:
++        """Return the number of complete, allocated blocks safe to store.
++
++        Prefix hashes exist before a request receives GPU blocks. Queued aborts
++        and preemptions can therefore expose more offload keys than physical KV
++        allocations. Clamp the logical prefix to the allocation boundary so a
++        cancelled request can never manufacture a store from unowned memory.
++        """
++        num_blocks = num_offloadable_tokens // group_config.offloaded_block_size
++        if group_config.is_eagle_group:
++            num_blocks = max(0, num_blocks - 1)
++        num_allocated_blocks = (
++            len(group_state.block_ids) // self.config.block_size_factor
++        )
++        return min(num_blocks, num_allocated_blocks)
++
+     def advance_stored_idx(self, num_offloadable_tokens: int) -> None:
+         for group_config, group_state in zip(
+             self.config.kv_group_configs, self.group_states
+         ):
+-            num_blocks = num_offloadable_tokens // group_config.offloaded_block_size
+-            group_state.next_stored_block_idx = num_blocks
++            num_blocks = self.storable_blocks(
++                group_config, group_state, num_offloadable_tokens
++            )
++            group_state.next_stored_block_idx = max(
++                group_state.next_stored_block_idx, num_blocks
++            )
+
+     def update_num_hit_blocks(self, num_cached_tokens: int) -> None:
+         for group_config, group_state in zip(
+             self.config.kv_group_configs, self.group_states
+         ):
+@@ -887,12 +912,19 @@ class OffloadingConnectorScheduler:
+             req_status = self._req_status.get(req_id)
+             if req_status is None:
+                 continue
+             req = req_status.req
+
+-            num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+-            num_tokens_after_batch = req.num_computed_tokens + num_scheduled_tokens
++            if req.status is RequestStatus.FINISHED_ABORTED:
++                # An abort can race a previously scheduled batch. Only KV that
++                # the request already records as computed is safe to persist.
++                num_tokens_after_batch = req.num_computed_tokens
++            else:
++                num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
++                num_tokens_after_batch = (
++                    req.num_computed_tokens + num_scheduled_tokens
++                )
+             # with async scheduling, some tokens may be missing
+             num_offloadable_tokens = min(num_tokens_after_batch, req.num_tokens)
+             max_offload_tokens = req_status.max_offload_tokens
+             if max_offload_tokens is not None:
+                 num_offloadable_tokens = min(num_offloadable_tokens, max_offload_tokens)
+@@ -910,13 +942,13 @@ class OffloadingConnectorScheduler:
+             # or unreachable by the load path's alignment constraints.
+             new_offload_keys: list[OffloadKey] = []
+             for group_config, group_state in zip(
+                 self.config.kv_group_configs, req_status.group_states
+             ):
+-                num_blocks = num_offloadable_tokens // group_config.offloaded_block_size
+-                if group_config.is_eagle_group:
+-                    num_blocks = max(0, num_blocks - 1)
++                num_blocks = req_status.storable_blocks(
++                    group_config, group_state, num_offloadable_tokens
++                )
+
+                 start_block_idx = group_state.next_stored_block_idx
+                 if num_blocks <= start_block_idx:
+                     continue
+                 offload_keys = group_state.offload_keys[start_block_idx:num_blocks]
+@@ -981,11 +1013,13 @@ class OffloadingConnectorScheduler:
+                 self.config.kv_group_configs, req_status.group_states
+             ):
+                 is_sliding_window = (
+                     group_config.sliding_window_size_in_blocks is not None
+                 )
+-                num_blocks = num_offloadable_tokens // group_config.offloaded_block_size
++                num_blocks = req_status.storable_blocks(
++                    group_config, group_state, num_offloadable_tokens
++                )
+                 start_block_idx = group_state.next_stored_block_idx
+                 block_ids = group_state.block_ids
+                 num_group_blocks = 0
+                 start_gpu_block_idx: int | None = None
+                 for idx, offload_key in enumerate(
+diff --git a/vllm/v1/kv_offload/tiering/base.py b/vllm/v1/kv_offload/tiering/base.py
+index b022e1f2f..d3ed0e354 100644
+--- a/vllm/v1/kv_offload/tiering/base.py
++++ b/vllm/v1/kv_offload/tiering/base.py
+@@ -169,10 +169,21 @@ class SecondaryTierManager(ABC):
+         While True, on_schedule_end() and get_finished_jobs() continue
+         to be called even when no requests are scheduled.
+         """
+         return False
+
++    def cancel_jobs(self, job_ids: Collection[JobId]) -> None:
++        """Cancel queued work for the selected jobs when the tier supports it.
++
++        A tier must never interrupt a task that is already copying data. Every
++        job with one or more cancelled queued tasks must still report exactly
++        one failed :class:`JobResult` after any active tasks for that job have
++        finished. The default is deliberately a no-op, so tiers without safe
++        queue cancellation retain their normal completion semantics.
++        """
++        return
++
+     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext):
+         """
+         Mark blocks as recently used for eviction policy.
+
+         Args:
+diff --git a/vllm/v1/kv_offload/tiering/fs/manager.py b/vllm/v1/kv_offload/tiering/fs/manager.py
+index 50ec1b7cf..8c3673953 100644
+--- a/vllm/v1/kv_offload/tiering/fs/manager.py
++++ b/vllm/v1/kv_offload/tiering/fs/manager.py
+@@ -16,11 +16,11 @@ File naming:  <base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash_hex>.bin
+ """
+
+ import functools
+ import json
+ import os
+-from collections.abc import Iterable
++from collections.abc import Collection, Iterable
+ from typing import TYPE_CHECKING
+
+ try:
+     from vllm.fs_io_C import batch_lookup as batch_lookup_C
+
+@@ -39,10 +39,11 @@ from vllm.v1.kv_offload.base import (
+ )
+ from vllm.v1.kv_offload.diag import emit_kv_offload_diag
+ from vllm.v1.kv_offload.file_mapper import FileMapper
+ from vllm.v1.kv_offload.tiering.async_lookup import AsyncLookupManager
+ from vllm.v1.kv_offload.tiering.base import (
++    JobId,
+     JobMetadata,
+     JobResult,
+     RequestOffloadingContext,
+     ScheduleEndContext,
+     SecondaryTierManager,
+@@ -218,10 +219,14 @@ class FileSystemTierManager(SecondaryTierManager):
+         return (
+             JobResult(job_id=job_id, success=success)
+             for job_id, success in self._pool.get_finished()
+         )
+
++    @override
++    def cancel_jobs(self, job_ids: Collection[JobId]) -> None:
++        self._pool.cancel_jobs(job_ids)
++
+     @override
+     def drain_jobs(self) -> None:
+         """Block until all in-flight transfers in the threadpool finish."""
+         self._pool.wait_idle()
+
+diff --git a/vllm/v1/kv_offload/tiering/fs/thread_pool.py b/vllm/v1/kv_offload/tiering/fs/thread_pool.py
+index 9bf8fe508..b3399b770 100644
+--- a/vllm/v1/kv_offload/tiering/fs/thread_pool.py
++++ b/vllm/v1/kv_offload/tiering/fs/thread_pool.py
+@@ -8,11 +8,11 @@ Thread pool:
+     Load jobs are enqueued to the load queue; store jobs to the store queue.
+ """
+
+ import threading
+ from collections import deque
+-from collections.abc import Callable, Iterable
++from collections.abc import Callable, Collection, Iterable
+
+ from vllm.logger import init_logger
+ from vllm.v1.kv_offload.tiering.base import JobId
+
+ logger = init_logger(__name__)
+@@ -124,10 +124,42 @@ class DualQueueThreadPool:
+         jobs = []
+         while self._finished_q:
+             jobs.append(self._finished_q.popleft())
+         return jobs
+
++    def cancel_jobs(self, job_ids: Collection[JobId]) -> set[JobId]:
++        """Cancel queued tasks while preserving one completion per job.
++
++        Tasks already removed by a worker are not interrupted. Removed tasks
++        are accounted as failures in their shared ``JobState``; once all active
++        and cancelled tasks converge, the ordinary finished queue reports the
++        failed job and releases the pool's in-flight count.
++        """
++        selected = set(job_ids)
++        if not selected:
++            return set()
++
++        cancelled: set[JobId] = set()
++        with self._condition:
++            for queue in (self._load_q, self._store_q):
++                retained = deque()
++                while queue:
++                    task, state = queue.popleft()
++                    if state.job_id not in selected:
++                        retained.append((task, state))
++                        continue
++
++                    cancelled.add(state.job_id)
++                    job_finished, success = state.task_done(False)
++                    if job_finished:
++                        self._finished_q.append((state.job_id, success))
++                        self._inflight_jobs -= 1
++                queue.extend(retained)
++            if cancelled:
++                self._condition.notify_all()
++        return cancelled
++
+     def wait_idle(self) -> None:
+         """Block until there are no in-flight jobs.
+
+         After this returns, every submitted job has had its last task
+         finish, so no worker thread is still copying data. Note:
+diff --git a/vllm/v1/kv_offload/tiering/manager.py b/vllm/v1/kv_offload/tiering/manager.py
+index 81151a7c0..9743713c9 100644
+--- a/vllm/v1/kv_offload/tiering/manager.py
++++ b/vllm/v1/kv_offload/tiering/manager.py
+@@ -579,15 +579,43 @@ class TieringOffloadingManager(OffloadingManager):
+         )
+         return RequestOffloadingContext(policy=policy)
+
+     @override
+     def on_request_finished(self, req_context: ReqContext) -> None:
++        self._cancel_request_promotions(req_context)
+         self.primary_tier.on_request_finished(req_context)
+         state = self._req_state[req_context.req_id]
+         state.is_finished = True
+         self._maybe_finalize_request(req_context.req_id)
+
++    def _cancel_request_promotions(self, req_context: ReqContext) -> None:
++        """Abandon promotion work that cannot benefit a finished request.
++
++        Deferred promotions have reserved primary slots but no tier I/O yet,
++        so release them immediately. Submitted promotions are offered to each
++        tier for queued-only cancellation; active copies finish normally and
++        all paths converge through ``get_finished_jobs``.
++        """
++        req_id = req_context.req_id
++        for tier, pending_by_req in list(self._pending_load_submissions.items()):
++            pending = pending_by_req.pop(req_id, None)
++            if pending is not None:
++                self.primary_tier.complete_write(
++                    pending.keys, pending.req_context, success=False
++                )
++            if not pending_by_req:
++                del self._pending_load_submissions[tier]
++
++        promotion_job_ids = {
++            job_id
++            for job_id, metadata in self._transfer_jobs.items()
++            if metadata.is_promotion and metadata.req_context.req_id == req_id
++        }
++        if promotion_job_ids:
++            for tier in self.secondary_tiers:
++                tier.cancel_jobs(promotion_job_ids)
++
+     def _maybe_finalize_request(self, req_id: str) -> None:
+         """Finalize secondary tiers once no more store cascades can be submitted.
+
+         Finalization means forwarding on_request_finished() to secondary tiers.
+         It is delayed until pending GPU->primary stores finish, since their

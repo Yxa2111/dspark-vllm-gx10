@@ -39,6 +39,9 @@ python3 -m py_compile \
   "$tmp_dir/vllm/vllm/v1/kv_cache_interface.py" \
   "$tmp_dir/vllm/vllm/v1/core/kv_cache_utils.py" \
   "$tmp_dir/vllm/vllm/v1/core/kv_cache_coordinator.py" \
+  "$tmp_dir/vllm/vllm/v1/kv_offload/tiering/base.py" \
+  "$tmp_dir/vllm/vllm/v1/kv_offload/tiering/fs/thread_pool.py" \
+  "$tmp_dir/vllm/vllm/v1/kv_offload/tiering/manager.py" \
   "$tmp_dir/vllm/vllm/v1/kv_offload/diag.py" \
   "$tmp_dir/vllm/vllm/v1/kv_offload/cpu/spec.py" \
   "$tmp_dir/vllm/vllm/v1/kv_offload/file_mapper.py" \
