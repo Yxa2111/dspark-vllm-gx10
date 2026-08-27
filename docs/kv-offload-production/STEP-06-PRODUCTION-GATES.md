@@ -80,7 +80,8 @@ disk_backend: bc9980d211e47eddb5146a4cf5ca7aaf822c04df151dacc59850dfb541bb32e4
 manager:      3dbfb24ab41b2f24faff30e388843af25bd5a46075e6430b19db97cc0e51ac1c
 ```
 
-Tests were run inside that final image with an offline local OPT config:
+Tests were run inside that final image with an offline local OPT config. The
+initial focused gate was:
 
 ```text
 7 disk-backend geometry/integrity/failure/queue/shutdown cases
@@ -90,6 +91,28 @@ Tests were run inside that final image with an offline local OPT config:
 
 The warnings were 14 PyTorch deprecations plus pytest's inability to write a
 cache under the intentionally read-only mounted test directory.
+
+The complete pinned `test_scheduler.py` was then run rather than relying on
+the one new scheduler case:
+
+```text
+31 passed, 15 warnings in 8.92s
+```
+
+Patch `0008-local-nvme-fault-tests.patch`, committed as Anemll `7fd268a`, adds
+a deterministic startup ENOSPC gate. It replaces `posix_fallocate` with an
+`ENOSPC` failure after the exact slot file has been opened and truncated, then
+proves that initialization closes the fd, unlinks the partial file, and starts
+neither I/O thread. The final image source plus the mounted test produced:
+
+```text
+8 disk-backend tests passed in 3.43s
+```
+
+This complements the existing checksum-corruption, short-I/O, background
+failure propagation, bounded-queue, and shutdown cases. The source/test patch
+stack now contains eight ordered patches; patch 0008 is test-only and does not
+change the release-image runtime bytes.
 
 ## Production status
 
@@ -101,7 +124,7 @@ does not replace the missing live gates:
    installed source hashes;
 3. prove a real disk load under a lower-memory isolated profile;
 4. rerun cancel/survivor cases at short and long contexts;
-5. pass fault injection, a 24-hour mixed soak, and a rollback drill.
+5. pass live TP2 fault injection, a 24-hour mixed soak, and a rollback drill.
 
 No Azusa Core admission control is added. Backpressure and resource bounds are
 owned by the vLLM/Anemll data plane where the work is created.
