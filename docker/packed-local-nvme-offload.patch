@@ -1,0 +1,922 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
+index f1dac13ca517697df91d2c1b93d7775177049142..5be1eefe241fcd6806294b2f94cb62db81d06e38 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
+@@ -41,6 +41,16 @@ logger = init_logger(__name__)
+ # Default CPU capacity: 8 GB
+ DEFAULT_CPU_CAPACITY_BYTES = 8 * (1024**3)
+ 
++VALID_KV_OFFLOAD_BACKENDS = ("cpu", "disk")
++# Keys that only apply to the disk backend, warned about under "cpu".
++_DISK_ONLY_KEYS = (
++    "disk_path",
++    "disk_capacity_bytes",
++    "disk_buffer_slots",
++    "use_page_cache",
++    "preallocate_disk",
++)
++
+ 
+ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
+     """CPU KV cache offloading with custom kernel transfers and BlockPool LRU."""
+@@ -76,6 +86,37 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
+ 
+         lazy_offload = bool(extra_config.get("lazy_offload", False))
+ 
++        kv_offload_backend = str(extra_config.get("kv_offload_backend", "cpu"))
++        if kv_offload_backend not in VALID_KV_OFFLOAD_BACKENDS:
++            raise ValueError(
++                f"Unknown kv_offload_backend {kv_offload_backend!r}; "
++                f"expected one of {VALID_KV_OFFLOAD_BACKENDS}"
++            )
++        disk_mode = kv_offload_backend == "disk"
++
++        disk_path = extra_config.get("disk_path", None) or None
++        disk_capacity_bytes = int(
++            extra_config.get("disk_capacity_bytes", 100 * (1024**3))
++        )
++        disk_buffer_slots = max(1, int(extra_config.get("disk_buffer_slots", 2)))
++        use_page_cache = bool(extra_config.get("use_page_cache", False))
++        preallocate_disk = bool(extra_config.get("preallocate_disk", True))
++
++        if disk_mode:
++            if disk_path is None:
++                raise ValueError(
++                    'kv_offload_backend="disk" requires disk_path to be set.'
++                )
++        else:
++            ignored = [k for k in _DISK_ONLY_KEYS if k in extra_config]
++            if ignored:
++                logger.warning(
++                    'kv_offload_backend is "cpu", ignoring disk-only config: %s. '
++                    'Set kv_offload_backend="disk" to enable the disk backend.',
++                    ", ".join(ignored),
++                )
++            disk_path = None
++
+         self.scheduler_manager: SimpleCPUOffloadScheduler | None = None
+         self.worker_handler: SimpleCPUOffloadWorker | None = None
+ 
+@@ -88,11 +129,13 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
+ 
+         logger.info(
+             "SimpleCPUOffloadConnector: role=%s, "
+-            "per_rank=%.2f GB, world_size=%d, mode=%s",
++            "per_rank=%.2f GB, world_size=%d, mode=%s, backend=%s, disk=%s",
+             role.name,
+             cpu_capacity_per_rank / (1024**3),
+             world_size,
+             "lazy" if lazy_offload else "eager",
++            kv_offload_backend,
++            disk_path or "none",
+         )
+ 
+         if role == KVConnectorRole.SCHEDULER:
+@@ -109,14 +152,27 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
+                 scheduler_block_size=scheduler_block_size,
+                 hash_block_size=hash_block_size,
+                 lazy_offload=lazy_offload,
++                disk_capacity_bytes=disk_capacity_bytes if disk_mode else 0,
+             )
+         elif role == KVConnectorRole.WORKER:
+             self.worker_handler = SimpleCPUOffloadWorker(
+-                vllm_config, kv_cache_config, cpu_capacity_per_rank
++                vllm_config,
++                kv_cache_config,
++                cpu_capacity_per_rank,
++                kv_offload_backend=kv_offload_backend,
++                disk_path=disk_path,
++                disk_capacity_bytes=disk_capacity_bytes,
++                disk_buffer_slots=disk_buffer_slots,
++                use_page_cache=use_page_cache,
++                preallocate_disk=preallocate_disk,
+             )
+ 
+     # --- Worker-side methods ---
+ 
++    def shutdown(self) -> None:
++        if self.worker_handler is not None:
++            self.worker_handler.shutdown()
++
+     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
+         if self.worker_handler is not None:
+             self.worker_handler.register_kv_caches(kv_caches)
+diff --git a/vllm/v1/simple_kv_offload/cuda_mem_ops.py b/vllm/v1/simple_kv_offload/cuda_mem_ops.py
+index 69b1677e0ac9a62d731aee4573270da2cbd34646..13574eafd1b9f6a0cbaccdefe2c538905add61eb 100644
+--- a/vllm/v1/simple_kv_offload/cuda_mem_ops.py
++++ b/vllm/v1/simple_kv_offload/cuda_mem_ops.py
+@@ -110,7 +110,9 @@ def _resolve_batch_memcpy():
+ class BatchMemcpyParams(NamedTuple):
+     src_bases: np.ndarray  # [num_layers] uint64 — data_ptr per layer
+     dst_bases: np.ndarray  # [num_layers] uint64
+-    bpb: np.ndarray  # [num_layers] uint64 — bytes per block
++    src_strides: np.ndarray  # [num_layers] uint64 — source bytes per row
++    dst_strides: np.ndarray  # [num_layers] uint64 — destination bytes per row
++    copy_sizes: np.ndarray  # [num_layers] uint64 — payload bytes per row
+     num_layers: int
+     # CUDA only: one attributes entry carrying srcAccessOrder. Unused on ROCm
+     # (7.2.1 or 7.2.2) because the current runtime rejects numAttrs > 0.
+@@ -132,24 +134,41 @@ def build_params(
+     if _batch_memcpy_fn is None:
+         _batch_memcpy_fn = _resolve_batch_memcpy()
+ 
+-    assert list(src_caches.keys()) == list(dst_caches.keys())
++    if list(src_caches.keys()) != list(dst_caches.keys()):
++        raise ValueError("source and destination cache names differ")
+     src_tensors = list(src_caches.values())
+     dst_tensors = list(dst_caches.values())
+ 
+-    src_bases, dst_bases, bpb = [], [], []
++    src_bases, dst_bases = [], []
++    src_strides, dst_strides, copy_sizes = [], [], []
+     for s, d in zip(src_tensors, dst_tensors):
+-        s_bpb = s.stride(0) * s.element_size()
+-        assert s_bpb == d.stride(0) * d.element_size()
++        if s.ndim < 2 or d.ndim < 2:
++            raise ValueError("KV cache tensors must have a block dimension")
++        s_stride = s.stride(0) * s.element_size()
++        d_stride = d.stride(0) * d.element_size()
++        s_payload = s[0].numel() * s.element_size()
++        d_payload = d[0].numel() * d.element_size()
++        if s_payload != d_payload:
++            raise ValueError(
++                f"KV block payload mismatch: source={s_payload}, "
++                f"destination={d_payload}"
++            )
++        if s_stride < s_payload or d_stride < d_payload:
++            raise ValueError("KV cache rows overlap")
+         src_bases.append(s.data_ptr())
+         dst_bases.append(d.data_ptr())
+-        bpb.append(s_bpb)
++        src_strides.append(s_stride)
++        dst_strides.append(d_stride)
++        copy_sizes.append(s_payload)
+ 
+     attrs = _CUmemcpyAttributes(srcAccessOrder=src_access_order)
+ 
+     return BatchMemcpyParams(
+         src_bases=np.array(src_bases, dtype=np.uint64),
+         dst_bases=np.array(dst_bases, dtype=np.uint64),
+-        bpb=np.array(bpb, dtype=np.uint64),
++        src_strides=np.array(src_strides, dtype=np.uint64),
++        dst_strides=np.array(dst_strides, dtype=np.uint64),
++        copy_sizes=np.array(copy_sizes, dtype=np.uint64),
+         num_layers=len(src_tensors),
+         attrs=attrs,
+         attrs_idx=ctypes.c_size_t(0),
+@@ -172,12 +191,14 @@ def copy_blocks(
+     dst_ids = np.array(dst_block_ids, dtype=np.uint64)
+ 
+     src_all = (
+-        params.src_bases[:, None] + src_ids[None, :] * params.bpb[:, None]
++        params.src_bases[:, None]
++        + src_ids[None, :] * params.src_strides[:, None]
+     ).ravel()
+     dst_all = (
+-        params.dst_bases[:, None] + dst_ids[None, :] * params.bpb[:, None]
++        params.dst_bases[:, None]
++        + dst_ids[None, :] * params.dst_strides[:, None]
+     ).ravel()
+-    sz_all = np.repeat(params.bpb, n)
++    sz_all = np.repeat(params.copy_sizes, n)
+     total = n * params.num_layers
+ 
+     # ROCm 7.2.1/7.2.2 rejects any call with numAttrs>0 (hipMemcpyBatchAsync
+diff --git a/vllm/v1/simple_kv_offload/disk_backend.py b/vllm/v1/simple_kv_offload/disk_backend.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..56aa8569da112762c51f7dd36be217d1e10da181
+--- /dev/null
++++ b/vllm/v1/simple_kv_offload/disk_backend.py
+@@ -0,0 +1,429 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Disk I/O backend for GPU<->NVMe block transfers via pinned staging buffers.
++
++Uses separate IO threads for store and load so that loads (latency-critical)
++never block behind stores (background work). Each thread owns its own pinned
++staging buffers to avoid contention.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import os
++import queue
++import threading
++import zlib
++
++import torch
++
++from vllm.logger import init_logger
++from vllm.platforms import current_platform
++from vllm.v1.simple_kv_offload.cuda_mem_ops import (
++    CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
++    CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
++    BatchMemcpyParams,
++    build_params,
++    copy_blocks,
++    pin_tensor,
++)
++
++logger = init_logger(__name__)
++
++O_DIRECT = getattr(os, "O_DIRECT", 0)
++_ALIGNMENT = 4096
++
++
++def aligned_disk_slot_bytes(payload_bytes: int) -> int:
++    if payload_bytes <= 0:
++        raise ValueError("payload_bytes must be positive")
++    return (payload_bytes + _ALIGNMENT - 1) // _ALIGNMENT * _ALIGNMENT
++
++
++def _alloc_aligned(num_slots: int, bpb: int) -> torch.Tensor:
++    """Allocate a staging buffer whose base address is O_DIRECT aligned.
++
++    The CPU allocator only guarantees 64-byte alignment, so over-allocate by
++    one alignment unit and return an aligned view. The view keeps the backing
++    storage alive.
++    """
++    nbytes = num_slots * bpb
++    raw = torch.zeros(nbytes + _ALIGNMENT, dtype=torch.int8, device="cpu")
++    offset = -raw.data_ptr() % _ALIGNMENT
++    return raw[offset : offset + nbytes].view(num_slots, bpb)
++
++
++class DiskBackend:
++    """Async disk offload backend with pipelined GPU DMA and interleaved IO.
++
++    Architecture:
++    - Separate coordinator threads for store and load (never block each other)
++    - Interleaved pipeline: DMA slot N while preadv/pwritev slot N-1
++    - O_DIRECT by default; page cache is opt-in via use_page_cache
++
++    Same launch_copy interface as DmaCopyBackend so the worker can swap
++    backends without changing calling code.
++    """
++
++    def __init__(self) -> None:
++        self._store_params: BatchMemcpyParams | None = None
++        self._load_params: BatchMemcpyParams | None = None
++        self._load_stream: torch.cuda.Stream | None = None
++        self._store_stream: torch.cuda.Stream | None = None
++        self._store_queue: queue.SimpleQueue = queue.SimpleQueue()
++        self._load_queue: queue.SimpleQueue = queue.SimpleQueue()
++        self._store_thread: threading.Thread | None = None
++        self._load_thread: threading.Thread | None = None
++        self._shutdown: bool = False
++        self._fd: int = -1
++        self._disk_path: str = ""
++        self._total_block_bytes: int = 0
++        self._disk_slot_bytes: int = 0
++        self._store_buffer_caches: dict[str, torch.Tensor] = {}
++        self._load_buffer_caches: dict[str, torch.Tensor] = {}
++        self._store_raw: torch.Tensor | None = None
++        self._load_raw: torch.Tensor | None = None
++        self._store_slot_views: list[list[memoryview]] = []
++        self._load_slot_views: list[list[memoryview]] = []
++        self._per_tensor_bpb: list[int] = []
++        self._tensor_names: list[str] = []
++        self._slot_checksums: list[int | None] = []
++        self._failure_lock = threading.Lock()
++        self._failure: RuntimeError | None = None
++
++    def init(
++        self,
++        gpu_caches: dict[str, torch.Tensor],
++        device: torch.device,
++        load_stream: torch.cuda.Stream,
++        store_stream: torch.cuda.Stream,
++        disk_path: str,
++        num_disk_slots: int,
++        total_block_bytes: int,
++        num_buffer_slots: int = 2,
++        use_page_cache: bool = False,
++        preallocate_disk: bool = True,
++    ) -> None:
++        self._load_stream = load_stream
++        self._store_stream = store_stream
++        self._total_block_bytes = total_block_bytes
++        self._num_buffer_slots = num_buffer_slots
++        self._tensor_names = list(gpu_caches.keys())
++        self._per_tensor_bpb = [
++            t.stride(0) * t.element_size() for t in gpu_caches.values()
++        ]
++        if sum(self._per_tensor_bpb) != total_block_bytes:
++            raise ValueError("GPU cache geometry does not match total_block_bytes")
++        self._disk_slot_bytes = aligned_disk_slot_bytes(total_block_bytes)
++        self._slot_checksums: list[int | None] = [None] * num_disk_slots
++
++        # Separate buffer pools for store and load threads
++        self._store_raw = _alloc_aligned(num_buffer_slots, self._disk_slot_bytes)
++        self._load_raw = _alloc_aligned(num_buffer_slots, self._disk_slot_bytes)
++        pin_tensor(self._store_raw)
++        pin_tensor(self._load_raw)
++
++        self._store_buffer_caches = self._build_payload_views(self._store_raw)
++        self._load_buffer_caches = self._build_payload_views(self._load_raw)
++
++        # Pre-built iovec views per slot (avoid per-transfer .numpy() calls)
++        self._store_slot_views = [
++            [
++                memoryview(self._store_raw[slot].numpy())
++            ]
++            for slot in range(num_buffer_slots)
++        ]
++        self._load_slot_views = [
++            [
++                memoryview(self._load_raw[slot].numpy())
++            ]
++            for slot in range(num_buffer_slots)
++        ]
++
++        self._store_params = build_params(
++            gpu_caches,
++            self._store_buffer_caches,
++            store_stream,
++            src_access_order=CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
++        )
++        self._load_params = build_params(
++            self._load_buffer_caches,
++            gpu_caches,
++            load_stream,
++            src_access_order=CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
++        )
++
++        os.makedirs(os.path.dirname(disk_path) or ".", exist_ok=True)
++        # Slot contents never outlive the process, so unlink then O_EXCL rather
++        # than reopening: a pre-existing file would otherwise keep its own
++        # (possibly world-readable) mode, and blocks may encode user prompts.
++        with contextlib.suppress(FileNotFoundError):
++            os.unlink(disk_path)
++        # O_DIRECT by default: page cache would consume the very host DRAM this
++        # backend exists to conserve, and doubles the copy on the store path.
++        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
++        if not use_page_cache:
++            if O_DIRECT == 0:
++                raise RuntimeError("O_DIRECT is unavailable on this platform")
++            flags |= O_DIRECT
++        self._fd = os.open(disk_path, flags, 0o600)
++        self._disk_path = disk_path
++        allocation_bytes = num_disk_slots * self._disk_slot_bytes
++        try:
++            os.ftruncate(self._fd, allocation_bytes)
++            if preallocate_disk:
++                os.posix_fallocate(self._fd, 0, allocation_bytes)
++        except BaseException:
++            os.close(self._fd)
++            self._fd = -1
++            with contextlib.suppress(OSError):
++                os.unlink(disk_path)
++            raise
++
++        logger.info(
++            "DiskBackend: path=%s, slots=%d, total=%.2f GB, "
++            "payload=%d slot=%d bytes, buf=%d"
++            " (page_cache=%s)",
++            disk_path,
++            num_disk_slots,
++            (num_disk_slots * self._disk_slot_bytes) / (1024**3),
++            total_block_bytes,
++            self._disk_slot_bytes,
++            num_buffer_slots,
++            use_page_cache,
++        )
++
++        self._store_thread = threading.Thread(
++            target=self._store_loop,
++            args=(device, store_stream),
++            daemon=True,
++        )
++        self._load_thread = threading.Thread(
++            target=self._load_loop,
++            args=(device, load_stream),
++            daemon=True,
++        )
++        self._store_thread.start()
++        self._load_thread.start()
++
++    def _build_payload_views(
++        self, raw: torch.Tensor
++    ) -> dict[str, torch.Tensor]:
++        views: dict[str, torch.Tensor] = {}
++        offset = 0
++        for name, payload_bytes in zip(self._tensor_names, self._per_tensor_bpb):
++            views[name] = torch.as_strided(
++                raw,
++                size=(raw.shape[0], payload_bytes),
++                stride=(self._disk_slot_bytes, 1),
++                storage_offset=raw.storage_offset() + offset,
++            )
++            offset += payload_bytes
++        if offset != self._total_block_bytes:
++            raise ValueError("staging payload layout does not fill the block")
++        return views
++
++    def launch_copy(
++        self,
++        src_blocks: list[int],
++        dst_blocks: list[int],
++        is_store: bool,
++        event_idx: int,
++        events_list: list[tuple[int, torch.Event]],
++        wait_event: torch.Event | None = None,
++    ) -> None:
++        self.raise_if_failed()
++        if len(src_blocks) != len(dst_blocks):
++            raise ValueError("source and destination block counts differ")
++        q = self._store_queue if is_store else self._load_queue
++        q.put((src_blocks, dst_blocks, event_idx, events_list, wait_event))
++
++    def _record_failure(
++        self, operation: str, event_idx: int, error: BaseException
++    ) -> None:
++        failure = RuntimeError(
++            f"KV disk {operation} event {event_idx} failed: "
++            f"{type(error).__name__}: {error}"
++        )
++        failure.__cause__ = error
++        with self._failure_lock:
++            if self._failure is None:
++                self._failure = failure
++        logger.exception(
++            "KV disk %s event %d failed; the engine will fail closed",
++            operation,
++            event_idx,
++            exc_info=error,
++        )
++
++    def raise_if_failed(self) -> None:
++        """Surface background I/O failures on the engine thread.
++
++        A dead coordinator thread must never look like an indefinitely pending
++        transfer to the scheduler.  Failing the engine is intentionally safer
++        than serving a request from missing or corrupt KV state.
++        """
++        with self._failure_lock:
++            failure = self._failure
++        if failure is not None:
++            raise failure
++
++    def shutdown(self) -> None:
++        if self._shutdown:
++            return
++        self._shutdown = True
++        self._store_queue.put(None)
++        self._load_queue.put(None)
++        if self._store_thread is not None:
++            self._store_thread.join(timeout=10.0)
++        if self._load_thread is not None:
++            self._load_thread.join(timeout=10.0)
++        if self._fd < 0:
++            return
++        # Slot contents can encode user prompts, so drop the name now rather
++        # than leaving them readable until the next run overwrites the file.
++        # Unlinking only removes the directory entry: any thread still holding
++        # the fd keeps writing to the (now anonymous) inode, which the kernel
++        # frees once the last fd goes away.
++        with contextlib.suppress(OSError):
++            os.unlink(self._disk_path)
++        # Closing under a still-running IO thread would let the fd number be
++        # reused by an unrelated open(), turning its next pwritev into a write
++        # into that file. Leaking one fd for the remaining process lifetime is
++        # the cheaper failure.
++        if any(
++            t is not None and t.is_alive()
++            for t in (self._store_thread, self._load_thread)
++        ):
++            logger.warning(
++                "IO thread still running after shutdown timeout; leaking fd %d",
++                self._fd,
++            )
++            return
++        os.close(self._fd)
++        self._fd = -1
++
++    def _store_loop(
++        self,
++        device: torch.device,
++        stream: torch.cuda.Stream,
++    ) -> None:
++        current_platform.set_device(device)
++        while True:
++            item = self._store_queue.get()
++            if item is None:
++                return
++            (src_blocks, dst_blocks, event_idx, events_list, wait_event) = item
++            try:
++                if wait_event is not None:
++                    stream.wait_event(wait_event)
++                self._do_store(src_blocks, dst_blocks, stream)
++                event = torch.Event()
++                event.record(stream)
++                events_list.append((event_idx, event))
++            except BaseException as error:
++                self._record_failure("store", event_idx, error)
++                return
++
++    def _writev_slot(self, buf_slot: int, disk_slot: int) -> None:
++        file_offset = disk_slot * self._disk_slot_bytes
++        written = os.pwritev(self._fd, self._store_slot_views[buf_slot], file_offset)
++        if written != self._disk_slot_bytes:
++            raise OSError(
++                f"Short write: expected {self._disk_slot_bytes} bytes, "
++                f"wrote {written}"
++            )
++        self._slot_checksums[disk_slot] = zlib.crc32(
++            self._store_slot_views[buf_slot][0]
++        )
++
++    def _readv_slot(self, buf_slot: int, disk_slot: int) -> None:
++        file_offset = disk_slot * self._disk_slot_bytes
++        bytes_read = os.preadv(self._fd, self._load_slot_views[buf_slot], file_offset)
++        if bytes_read != self._disk_slot_bytes:
++            raise OSError(
++                f"Short read: expected {self._disk_slot_bytes} bytes, "
++                f"read {bytes_read}"
++            )
++        expected = self._slot_checksums[disk_slot]
++        actual = zlib.crc32(self._load_slot_views[buf_slot][0])
++        if expected is None or actual != expected:
++            raise OSError(
++                f"KV disk checksum mismatch for slot {disk_slot}: "
++                f"expected={expected}, actual={actual}"
++            )
++
++    def _load_loop(
++        self,
++        device: torch.device,
++        stream: torch.cuda.Stream,
++    ) -> None:
++        current_platform.set_device(device)
++        while True:
++            item = self._load_queue.get()
++            if item is None:
++                return
++            (src_blocks, dst_blocks, event_idx, events_list, wait_event) = item
++            try:
++                if wait_event is not None:
++                    stream.wait_event(wait_event)
++                self._do_load(src_blocks, dst_blocks, stream)
++                event = torch.Event()
++                event.record(stream)
++                events_list.append((event_idx, event))
++            except BaseException as error:
++                self._record_failure("load", event_idx, error)
++                return
++
++    def _do_store(
++        self,
++        gpu_blocks: list[int],
++        disk_slots: list[int],
++        stream: torch.cuda.Stream,
++    ) -> None:
++        """GPU -> buffer (DMA) -> disk (pwritev), interleaved double-buffer."""
++        assert self._store_params is not None
++        n = self._num_buffer_slots
++        # (DMA event, disk slot) of the block already staged in each buffer.
++        pending: list[tuple[torch.Event, int] | None] = [None] * n
++
++        for i, (gpu_blk, disk_slot) in enumerate(zip(gpu_blocks, disk_slots)):
++            buf_slot = i % n
++            prev = pending[buf_slot]
++            if prev is not None:
++                prev[0].synchronize()
++                self._writev_slot(buf_slot, prev[1])
++
++            copy_blocks([gpu_blk], [buf_slot], self._store_params)
++            ev = torch.Event()
++            ev.record(stream)
++            pending[buf_slot] = (ev, disk_slot)
++
++        for slot, last in enumerate(pending):
++            if last is not None:
++                last[0].synchronize()
++                self._writev_slot(slot, last[1])
++
++    def _do_load(
++        self,
++        disk_slots: list[int],
++        gpu_blocks: list[int],
++        stream: torch.cuda.Stream,
++    ) -> None:
++        """Disk (preadv) -> buffer -> GPU (DMA), interleaved double-buffer."""
++        assert self._load_params is not None
++        n = self._num_buffer_slots
++        prev_dma_events: list[torch.Event | None] = [None] * n
++
++        for i, (disk_slot, gpu_blk) in enumerate(zip(disk_slots, gpu_blocks)):
++            buf_slot = i % n
++            prev = prev_dma_events[buf_slot]
++            if prev is not None:
++                prev.synchronize()
++
++            self._readv_slot(buf_slot, disk_slot)
++
++            copy_blocks([buf_slot], [gpu_blk], self._load_params)
++            ev = torch.Event()
++            ev.record(stream)
++            prev_dma_events[buf_slot] = ev
+diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/manager.py
+index dfaa2234eb97460543c61e07ddffd72e33609ef3..67c709cb490c6bca58375b7a95d4caa331f705d2 100644
+--- a/vllm/v1/simple_kv_offload/manager.py
++++ b/vllm/v1/simple_kv_offload/manager.py
+@@ -12,6 +12,7 @@ from vllm.distributed.kv_events import KVCacheEvent
+ from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
+ from vllm.logger import init_logger
+ from vllm.utils.math_utils import cdiv
++from vllm.v1.simple_kv_offload.disk_backend import aligned_disk_slot_bytes
+ from vllm.v1.core.block_pool import BlockPool
+ from vllm.v1.core.kv_cache_coordinator import (
+     KVCacheCoordinator,
+@@ -75,9 +76,14 @@ class SimpleCPUOffloadScheduler:
+         scheduler_block_size: int,
+         hash_block_size: int,
+         lazy_offload: bool = False,
++        disk_capacity_bytes: int = 0,
+     ):
+         self.vllm_config = vllm_config
+         self.kv_cache_config = kv_cache_config
++        # When disk mode is active, the offload pool size is disk-based.
++        offload_capacity = (
++            disk_capacity_bytes if disk_capacity_bytes > 0 else cpu_capacity_bytes
++        )
+         self.enable_kv_cache_events = (
+             vllm_config.kv_events_config is not None
+             and vllm_config.kv_events_config.enable_kv_cache_events
+@@ -91,7 +97,9 @@ class SimpleCPUOffloadScheduler:
+         # Derive a CPU KVCacheConfig from the GPU config and build a coordinator
+         assert kv_cache_config is not None
+         self.cpu_kv_cache_config = self._derive_cpu_config(
+-            kv_cache_config, cpu_capacity_bytes
++            kv_cache_config,
++            offload_capacity,
++            align_disk_blocks=disk_capacity_bytes > 0,
+         )
+         self.num_cpu_blocks = self.cpu_kv_cache_config.num_blocks
+         # Find the full attention kv group for prefix cache matching.
+@@ -112,20 +120,23 @@ class SimpleCPUOffloadScheduler:
+         assert self.block_size % self.fa_block_size == 0
+ 
+         logger.info(
+-            "SimpleCPUOffloadScheduler: Allocating %d CPU blocks (%.2f GB, mode=%s)",
++            "SimpleCPUOffloadScheduler: Allocating %d offload blocks "
++            "(%.2f GB, mode=%s, backend=%s)",
+             self.num_cpu_blocks,
+-            cpu_capacity_bytes / (1024**3),
++            offload_capacity / (1024**3),
+             "lazy" if lazy_offload else "eager",
++            "disk" if disk_capacity_bytes > 0 else "cpu",
+         )
+ 
+-        # TODO (yifan): maybe need to enable kv_cache_events and metrics_collector here.
++        spec_config = vllm_config.speculative_config
++        use_eagle = spec_config is not None and spec_config.use_eagle()
+         self.cpu_coordinator: KVCacheCoordinator = get_kv_cache_coordinator(
+             kv_cache_config=self.cpu_kv_cache_config,
+             max_model_len=vllm_config.model_config.max_model_len,
+             max_num_batched_tokens=(
+                 vllm_config.scheduler_config.max_num_batched_tokens
+             ),
+-            use_eagle=False,
++            use_eagle=use_eagle,
+             enable_caching=True,
+             enable_kv_cache_events=self.enable_kv_cache_events,
+             dcp_world_size=dcp_world_size,
+@@ -134,7 +145,6 @@ class SimpleCPUOffloadScheduler:
+             hash_block_size=self.hash_block_size,
+         )
+         self.cpu_block_pool: BlockPool = self.cpu_coordinator.block_pool
+-
+         # GPU block pool reference - bound after scheduler builds kv_cache_manager
+         self._gpu_block_pool: BlockPool | None = None
+ 
+@@ -181,7 +191,9 @@ class SimpleCPUOffloadScheduler:
+ 
+     @staticmethod
+     def _derive_cpu_config(
+-        gpu_config: "KVCacheConfig", cpu_capacity_bytes: int
++        gpu_config: "KVCacheConfig",
++        cpu_capacity_bytes: int,
++        align_disk_blocks: bool = False,
+     ) -> "KVCacheConfig":
+         """Derive a CPU KVCacheConfig from the GPU config.
+         Same kv_cache_groups, num_blocks scaled by CPU/GPU memory ratio."""
+@@ -199,7 +211,20 @@ class SimpleCPUOffloadScheduler:
+             else sum(t.size for t in gpu_config.kv_cache_tensors)
+         )
+         num_gpu_blocks = gpu_config.num_blocks
+-        num_cpu_blocks = max(1, num_gpu_blocks * cpu_capacity_bytes // gpu_total_bytes)
++        if align_disk_blocks and gpu_total_bytes % num_gpu_blocks != 0:
++            raise ValueError(
++                "GPU KV cache size is not divisible by its block count; "
++                "cannot derive an exact direct-I/O slot geometry"
++            )
++        bytes_per_block = gpu_total_bytes // num_gpu_blocks
++        if align_disk_blocks:
++            bytes_per_block = aligned_disk_slot_bytes(bytes_per_block)
++        num_cpu_blocks = cpu_capacity_bytes // bytes_per_block
++        if num_cpu_blocks < 1:
++            raise ValueError(
++                f"offload capacity {cpu_capacity_bytes} is smaller than one "
++                f"block ({bytes_per_block} bytes)"
++            )
+         # Create CPU kv_cache_tensors mirroring GPU by scaling size proportionally.
+         cpu_tensors = [
+             KVCacheTensor(
+diff --git a/vllm/v1/simple_kv_offload/worker.py b/vllm/v1/simple_kv_offload/worker.py
+index 9cb9c02ed7c5abbc78a78028350578abc5282acb..2eb930704ed6f41ca7a2e18a52d83a1d73001117 100644
+--- a/vllm/v1/simple_kv_offload/worker.py
++++ b/vllm/v1/simple_kv_offload/worker.py
+@@ -11,6 +11,10 @@ from vllm.logger import init_logger
+ from vllm.utils.torch_utils import PIN_MEMORY
+ from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend
+ from vllm.v1.simple_kv_offload.cuda_mem_ops import pin_tensor
++from vllm.v1.simple_kv_offload.disk_backend import (
++    DiskBackend,
++    aligned_disk_slot_bytes,
++)
+ from vllm.v1.simple_kv_offload.metadata import (
+     SimpleCPUOffloadMetadata,
+     SimpleCPUOffloadWorkerMetadata,
+@@ -30,10 +34,22 @@ class SimpleCPUOffloadWorker:
+         vllm_config: VllmConfig,
+         kv_cache_config: "KVCacheConfig | None",
+         cpu_capacity_bytes: int,
++        kv_offload_backend: str = "cpu",
++        disk_path: str | None = None,
++        disk_capacity_bytes: int = 0,
++        disk_buffer_slots: int = 2,
++        use_page_cache: bool = False,
++        preallocate_disk: bool = True,
+     ):
+         self.vllm_config = vllm_config
+         self.kv_cache_config = kv_cache_config
+         self.cpu_capacity_bytes = cpu_capacity_bytes
++        self.disk_path = disk_path
++        self.disk_capacity_bytes = disk_capacity_bytes
++        self.disk_buffer_slots = disk_buffer_slots
++        self.use_page_cache = use_page_cache
++        self.preallocate_disk = preallocate_disk
++        self.disk_mode = kv_offload_backend == "disk"
+ 
+         self.gpu_kv_caches: dict[str, torch.Tensor] | None = None
+         self.cpu_kv_caches: dict[str, torch.Tensor] | None = None
+@@ -44,7 +60,7 @@ class SimpleCPUOffloadWorker:
+         self.load_stream: torch.cuda.Stream | None = None
+         self.store_stream: torch.cuda.Stream | None = None
+ 
+-        self._backend = DmaCopyBackend()
++        self._backend: DmaCopyBackend | DiskBackend | None = None
+ 
+         # Ordered (event_idx, Event). Events pre-allocated on main thread.
+         self._load_events: list[tuple[int, torch.Event]] = []
+@@ -119,6 +135,11 @@ class SimpleCPUOffloadWorker:
+         unique_gpu_caches: dict[str, torch.Tensor] = {}
+         for name, tensor in seen_ptrs.values():
+             storage = tensor.untyped_storage()
++            if storage.nbytes() % num_blocks != 0:
++                raise ValueError(
++                    f"KV storage for {name} has {storage.nbytes()} bytes, "
++                    f"not divisible by {num_blocks} blocks"
++                )
+             raw = torch.empty(0, dtype=torch.int8, device=self.device).set_(
+                 storage, 0, (storage.nbytes(),)
+             )
+@@ -145,9 +166,69 @@ class SimpleCPUOffloadWorker:
+ 
+         self.num_cpu_blocks = max(1, self.cpu_capacity_bytes // total_bytes_per_block)
+ 
++        # Use lowest priority so KV cache I/O yields to compute streams.
++        low_pri, _ = torch.cuda.Stream.priority_range()
++        self.load_stream = torch.cuda.Stream(priority=low_pri)
++        self.store_stream = torch.cuda.Stream(priority=low_pri)
++
++        self.gpu_kv_caches = unique_gpu_caches
++
++        if self.disk_mode:
++            self._init_disk_mode(unique_gpu_caches, total_bytes_per_block, self.device)
++        else:
++            self._init_cpu_mode(unique_gpu_caches, total_bytes_per_block, self.device)
++
++    def _init_disk_mode(
++        self,
++        unique_gpu_caches: dict[str, torch.Tensor],
++        total_bytes_per_block: int,
++        device: torch.device,
++    ) -> None:
++        disk_slot_bytes = aligned_disk_slot_bytes(total_bytes_per_block)
++        num_disk_slots = self.disk_capacity_bytes // disk_slot_bytes
++        if num_disk_slots < 1:
++            raise ValueError(
++                f"disk capacity {self.disk_capacity_bytes} is smaller than one "
++                f"aligned block ({disk_slot_bytes} bytes)"
++            )
++        self.num_cpu_blocks = num_disk_slots
++
+         logger.info(
+-            "SimpleCPUOffloadWorker: %d unique GPU KV tensors, "
+-            "allocating %d CPU blocks (%.2f GB)",
++            "SimpleCPUOffloadWorker [DISK]: %d tensors, %d disk slots (%.2f GB)",
++            len(unique_gpu_caches),
++            num_disk_slots,
++            (num_disk_slots * total_bytes_per_block) / (1024**3),
++        )
++
++        assert self.disk_path is not None
++        rank = self.vllm_config.parallel_config.rank
++        rank_path = f"{self.disk_path}.rank_{rank}"
++        self._backend = DiskBackend()
++        self._backend.init(
++            unique_gpu_caches,
++            device,
++            self.load_stream,
++            self.store_stream,
++            rank_path,
++            num_disk_slots,
++            total_bytes_per_block,
++            self.disk_buffer_slots,
++            self.use_page_cache,
++            self.preallocate_disk,
++        )
++
++    def shutdown(self) -> None:
++        if self._backend is not None:
++            self._backend.shutdown()
++
++    def _init_cpu_mode(
++        self,
++        unique_gpu_caches: dict[str, torch.Tensor],
++        total_bytes_per_block: int,
++        device: torch.device,
++    ) -> None:
++        logger.info(
++            "SimpleCPUOffloadWorker [CPU]: %d tensors, %d CPU blocks (%.2f GB)",
+             len(unique_gpu_caches),
+             self.num_cpu_blocks,
+             (self.num_cpu_blocks * total_bytes_per_block) / (1024**3),
+@@ -159,7 +240,6 @@ class SimpleCPUOffloadWorker:
+                 "Pinned memory not available. CPU offload performance may be degraded."
+             )
+ 
+-        self.gpu_kv_caches = unique_gpu_caches
+         self.cpu_kv_caches = {}
+         for name, gpu_tensor in unique_gpu_caches.items():
+             cpu_shape = (self.num_cpu_blocks,) + gpu_tensor.shape[1:]
+@@ -171,16 +251,11 @@ class SimpleCPUOffloadWorker:
+                 pin_tensor(tensor)
+             self.cpu_kv_caches[name] = tensor
+ 
+-        # Use lowest priority so KV cache I/O yields to compute streams.
+-        low_pri, _ = torch.cuda.Stream.priority_range()
+-        self.load_stream = torch.cuda.Stream(priority=low_pri)
+-        self.store_stream = torch.cuda.Stream(priority=low_pri)
+-
+-        # Initialize copy backend with caches and streams.
++        self._backend = DmaCopyBackend()
+         self._backend.init(
+-            self.gpu_kv_caches,
++            unique_gpu_caches,
+             self.cpu_kv_caches,
+-            self.device,
++            device,
+             self.load_stream,
+             self.store_stream,
+         )
+@@ -221,11 +296,16 @@ class SimpleCPUOffloadWorker:
+             - finished_sending: always None (stores use worker metadata).
+             - finished_recving: req_ids whose loads have completed.
+         """
++        if isinstance(self._backend, DiskBackend):
++            self._backend.raise_if_failed()
++
+         # (1) Submit transfers
+         metadata = self._connector_metadata
+         if metadata is not None:
++            backend = self._backend
++            assert backend is not None
+             if metadata.load_cpu_blocks:
+-                self._backend.launch_copy(
++                backend.launch_copy(
+                     metadata.load_cpu_blocks,
+                     metadata.load_gpu_blocks,
+                     is_store=False,
+@@ -236,7 +316,7 @@ class SimpleCPUOffloadWorker:
+                 if self._store_compute_done is None:
+                     self._store_compute_done = torch.Event()
+                 self._store_compute_done.record(torch.cuda.current_stream())
+-                self._backend.launch_copy(
++                backend.launch_copy(
+                     metadata.store_gpu_blocks,
+                     metadata.store_cpu_blocks,
+                     is_store=True,
+@@ -264,6 +344,9 @@ class SimpleCPUOffloadWorker:
+                 self._pending_store_event_indices.discard(j)
+                 self._completed_store_events[j] = 1
+ 
++        if isinstance(self._backend, DiskBackend):
++            self._backend.raise_if_failed()
++
+         return None, finished_recving or None
+ 
+     def build_connector_worker_meta(self) -> SimpleCPUOffloadWorkerMetadata | None:

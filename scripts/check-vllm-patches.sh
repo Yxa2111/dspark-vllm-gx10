@@ -50,7 +50,12 @@ python3 -m py_compile \
   "$tmp_dir/vllm/vllm/v1/kv_offload/file_mapper.py" \
   "$tmp_dir/vllm/vllm/v1/kv_offload/tiering/fs/manager.py" \
   "$tmp_dir/vllm/vllm/v1/kv_offload/tiering/spec.py" \
+  "$tmp_dir/vllm/vllm/v1/simple_kv_offload/cuda_mem_ops.py" \
+  "$tmp_dir/vllm/vllm/v1/simple_kv_offload/disk_backend.py" \
+  "$tmp_dir/vllm/vllm/v1/simple_kv_offload/manager.py" \
+  "$tmp_dir/vllm/vllm/v1/simple_kv_offload/worker.py" \
   "$tmp_dir/vllm/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py" \
-  "$tmp_dir/vllm/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py"
+  "$tmp_dir/vllm/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py" \
+  "$tmp_dir/vllm/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py"
 
 echo "Validated ${#vllm_patches[@]} patch(es) against $VLLM_COMMIT"
