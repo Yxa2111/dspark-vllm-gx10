@@ -13,6 +13,7 @@ document, implementation, tests, and commit all agree.
 | 05 | [`STEP-05-FILESYSTEM.md`](STEP-05-FILESYSTEM.md) | packed local NVMe capacity, integrity, and write layout | live store proved; restore rejected by host failure |
 | 06 | [`STEP-06-PRODUCTION-GATES.md`](STEP-06-PRODUCTION-GATES.md) | bounded work and deterministic offline faults | complete |
 | 07 | [`STEP-07-LIVE-POSTMORTEM.md`](STEP-07-LIVE-POSTMORTEM.md) | recovered-head UMA pressure diagnosis and revised live gates | complete |
+| 08 | [`STEP-08-RESTART-PERSISTENCE-AUDIT.md`](STEP-08-RESTART-PERSISTENCE-AUDIT.md) | crash-safe rank-local restart-persistence contract | audit complete; implementation next |
 
 The source baseline is fixed by `upstream.lock`. Production changes remain an
 ordered patch series until they are accepted upstream; thin-image patching is
