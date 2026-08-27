@@ -14,7 +14,8 @@ document, implementation, tests, and commit all agree.
 | 06 | [`STEP-06-PRODUCTION-GATES.md`](STEP-06-PRODUCTION-GATES.md) | bounded work and deterministic offline faults | complete |
 | 07 | [`STEP-07-LIVE-POSTMORTEM.md`](STEP-07-LIVE-POSTMORTEM.md) | recovered-head UMA pressure diagnosis and revised live gates | complete |
 | 08 | [`STEP-08-RESTART-PERSISTENCE-AUDIT.md`](STEP-08-RESTART-PERSISTENCE-AUDIT.md) | crash-safe rank-local restart-persistence contract | audit complete; implemented in Step 09 |
-| 09 | [`STEP-09-PERSISTENT-INDEX-IMPLEMENTATION.md`](STEP-09-PERSISTENT-INDEX-IMPLEMENTATION.md) | durable rank manifests and scheduler commit index | offline implementation complete; TP=2 restart gate next |
+| 09 | [`STEP-09-PERSISTENT-INDEX-IMPLEMENTATION.md`](STEP-09-PERSISTENT-INDEX-IMPLEMENTATION.md) | durable rank manifests and scheduler commit index | offline implementation complete; live restart passed in Step 10 |
+| 10 | [`STEP-10-TP2-RESTART-PROOF.md`](STEP-10-TP2-RESTART-PROOF.md) | interrupted-store authority and full TP=2 restart replay | functional restart gate passed; fault recovery and production stability remain |
 
 The source baseline is fixed by `upstream.lock`. Production changes remain an
 ordered patch series until they are accepted upstream; thin-image patching is
