@@ -1,0 +1,735 @@
+From ee85d39f863e7f8b522d05395d406e1c8b1fdb44 Mon Sep 17 00:00:00 2001
+From: Yxa2111 <yxa2013@outlook.com>
+Date: Fri, 28 Aug 2026 22:09:38 +0800
+Subject: [PATCH] feat: export packed NVMe KV metrics
+
+---
+ .../v1/simple_cpu_offload_connector.py        |  38 +++
+ vllm/v1/simple_kv_offload/disk_backend.py     | 130 +++++++++
+ vllm/v1/simple_kv_offload/manager.py          |  53 +++-
+ vllm/v1/simple_kv_offload/metrics.py          | 276 ++++++++++++++++++
+ vllm/v1/simple_kv_offload/worker.py           |   7 +
+ 5 files changed, 497 insertions(+), 7 deletions(-)
+ create mode 100644 vllm/v1/simple_kv_offload/metrics.py
+
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
+index fc696b4ba..8af43519d 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py
+@@ -16,6 +16,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+     KVConnectorRole,
+     SupportsHMA,
+ )
++from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
++    KVConnectorPromMetrics,
++    KVConnectorStats,
++    PromMetric,
++    PromMetricT,
++)
+ from vllm.logger import init_logger
+ from vllm.v1.core.sched.output import SchedulerOutput
+ from vllm.v1.outputs import KVConnectorOutput
+@@ -25,6 +31,10 @@ from vllm.v1.simple_kv_offload.manager import (
+ from vllm.v1.simple_kv_offload.metadata import (
+     SimpleCPUOffloadMetadata,
+ )
++from vllm.v1.simple_kv_offload.metrics import (
++    SimpleCPUOffloadPromMetrics,
++    SimpleCPUOffloadStats,
++)
+ from vllm.v1.simple_kv_offload.worker import (
+     SimpleCPUOffloadWorker,
+ )
+@@ -282,6 +292,34 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
+             return self.worker_handler.get_finished(finished_req_ids)
+         return None, None
+ 
++    def get_kv_connector_stats(self) -> KVConnectorStats | None:
++        if self.worker_handler is not None:
++            return self.worker_handler.get_kv_connector_stats()
++        if self.scheduler_manager is not None:
++            return self.scheduler_manager.get_kv_connector_stats()
++        return None
++
++    @classmethod
++    def build_kv_connector_stats(
++        cls, data: dict[str, Any] | None = None
++    ) -> KVConnectorStats:
++        return SimpleCPUOffloadStats(data=data or {})
++
++    @classmethod
++    def build_prom_metrics(
++        cls,
++        vllm_config: VllmConfig,
++        metric_types: dict[type[PromMetric], type[PromMetricT]],
++        labelnames: list[str],
++        per_engine_labelvalues: dict[int, list[object]],
++    ) -> KVConnectorPromMetrics:
++        return SimpleCPUOffloadPromMetrics(
++            vllm_config,
++            metric_types,
++            labelnames,
++            per_engine_labelvalues,
++        )
++
+     def build_connector_worker_meta(self):
+         if self.worker_handler is not None:
+             return self.worker_handler.build_connector_worker_meta()
+diff --git a/vllm/v1/simple_kv_offload/disk_backend.py b/vllm/v1/simple_kv_offload/disk_backend.py
+index 8d6348e58..7a8bac1d3 100644
+--- a/vllm/v1/simple_kv_offload/disk_backend.py
++++ b/vllm/v1/simple_kv_offload/disk_backend.py
+@@ -13,6 +13,7 @@ import contextlib
+ import os
+ import queue
+ import threading
++import time
+ import zlib
+ from collections.abc import Mapping
+ 
+@@ -28,6 +29,22 @@ from vllm.v1.simple_kv_offload.cuda_mem_ops import (
+     copy_blocks,
+     pin_tensor,
+ )
++from vllm.v1.simple_kv_offload.metrics import (
++    DISK_BUFFER_SLOTS,
++    DISK_CAPACITY_BYTES,
++    DISK_CAPACITY_SLOTS,
++    DISK_COMMITTED_SLOTS,
++    DISK_ERRORS,
++    DISK_INFLIGHT_BLOCKS,
++    DISK_QUEUE_DEPTH,
++    DISK_RESTORED_SLOTS,
++    DISK_STAGING_BYTES,
++    DISK_TRANSFER_BLOCKS,
++    DISK_TRANSFER_BYTES,
++    DISK_TRANSFER_DURATION,
++    DISK_TRANSFER_OPERATIONS,
++    SimpleCPUOffloadStats,
++)
+ from vllm.v1.simple_kv_offload.persistent_metadata import (
+     RankSlotManifest,
+     validate_private_regular_fd,
+@@ -98,6 +115,13 @@ class DiskBackend:
+         self._manifest: RankSlotManifest | None = None
+         self._failure_lock = threading.Lock()
+         self._failure: RuntimeError | None = None
++        self._metrics_lock = threading.Lock()
++        self._interval_metrics = SimpleCPUOffloadStats()
++        self._inflight_blocks = {"load": 0, "store": 0}
++        self._rank: int = 0
++        self._num_disk_slots: int = 0
++        self._restored_slots: int = 0
++        self._valid_slots: set[int] = set()
+ 
+     def init(
+         self,
+@@ -115,6 +139,7 @@ class DiskBackend:
+         enqueue_timeout_s: float = 30.0,
+         persistent: bool = False,
+         persistent_identity: Mapping[str, object] | None = None,
++        rank: int = 0,
+     ) -> None:
+         self._load_stream = load_stream
+         self._store_stream = store_stream
+@@ -128,6 +153,8 @@ class DiskBackend:
+         self._load_queue = queue.Queue(maxsize=queue_depth)
+         self._enqueue_timeout_s = enqueue_timeout_s
+         self._persistent = persistent
++        self._rank = rank
++        self._num_disk_slots = num_disk_slots
+         if persistent and persistent_identity is None:
+             raise ValueError("persistent disk mode requires an identity")
+         self._tensor_names = list(gpu_caches.keys())
+@@ -221,6 +248,12 @@ class DiskBackend:
+                     persistent_identity,
+                 )
+                 self._slot_checksums = self._manifest.load()
++                self._valid_slots = {
++                    slot
++                    for slot, checksum in enumerate(self._slot_checksums)
++                    if checksum is not None
++                }
++                self._restored_slots = len(self._valid_slots)
+         except BaseException:
+             if self._manifest is not None:
+                 self._manifest.close()
+@@ -301,11 +334,89 @@ class DiskBackend:
+                 timeout=self._enqueue_timeout_s,
+             )
+         except queue.Full as error:
++            self._record_error(operation, "queue_timeout")
+             raise RuntimeError(
+                 f"KV disk {operation} queue remained full for "
+                 f"{self._enqueue_timeout_s:.1f}s (depth={q.maxsize})"
+             ) from error
+ 
++    def get_stats(self) -> SimpleCPUOffloadStats:
++        """Drain interval counters and append a current bounded-state snapshot."""
++        with self._metrics_lock:
++            stats = self._interval_metrics
++            self._interval_metrics = SimpleCPUOffloadStats()
++            inflight = dict(self._inflight_blocks)
++            valid_slots = len(self._valid_slots)
++
++        rank = str(self._rank)
++        scope = f"rank_{rank}"
++        stats.set_gauge(
++            DISK_CAPACITY_BYTES,
++            self._num_disk_slots * self._disk_slot_bytes,
++            (scope,),
++        )
++        stats.set_gauge(DISK_CAPACITY_SLOTS, self._num_disk_slots, (scope,))
++        stats.set_gauge(DISK_COMMITTED_SLOTS, valid_slots, (scope,))
++        stats.set_gauge(DISK_RESTORED_SLOTS, self._restored_slots, (scope,))
++        for operation, transfer_queue in (
++            ("load", self._load_queue),
++            ("store", self._store_queue),
++        ):
++            labels = (rank, operation)
++            stats.set_gauge(
++                DISK_STAGING_BYTES,
++                self._num_buffer_slots * self._disk_slot_bytes,
++                labels,
++            )
++            stats.set_gauge(DISK_BUFFER_SLOTS, self._num_buffer_slots, labels)
++            stats.set_gauge(DISK_QUEUE_DEPTH, transfer_queue.qsize(), labels)
++            stats.set_gauge(DISK_INFLIGHT_BLOCKS, inflight[operation], labels)
++        return stats
++
++    def _record_error(self, operation: str, reason: str) -> None:
++        with self._metrics_lock:
++            self._interval_metrics.increase_counter(
++                DISK_ERRORS,
++                1,
++                (str(self._rank), operation, reason),
++            )
++
++    def _record_transfer(
++        self,
++        operation: str,
++        num_blocks: int,
++        duration_s: float,
++    ) -> None:
++        labels = (str(self._rank), operation)
++        with self._metrics_lock:
++            self._interval_metrics.increase_counter(
++                DISK_TRANSFER_BYTES,
++                num_blocks * self._disk_slot_bytes,
++                labels,
++            )
++            self._interval_metrics.increase_counter(
++                DISK_TRANSFER_BLOCKS, num_blocks, labels
++            )
++            self._interval_metrics.increase_counter(DISK_TRANSFER_OPERATIONS, 1, labels)
++            self._interval_metrics.observe_histogram(
++                DISK_TRANSFER_DURATION, duration_s, labels
++            )
++
++    def _set_inflight(self, operation: str, num_blocks: int) -> None:
++        with self._metrics_lock:
++            self._inflight_blocks[operation] = num_blocks
++
++    @staticmethod
++    def _classify_error(error: BaseException) -> str:
++        message = str(error).lower()
++        if "checksum mismatch" in message:
++            return "checksum"
++        if "short read" in message or "short write" in message:
++            return "short_io"
++        if isinstance(error, OSError):
++            return "io"
++        return "other"
++
+     @staticmethod
+     def _replace_pending_with_stop(q: queue.Queue) -> None:
+         """Drop queued process-lifetime work and install one stop sentinel."""
+@@ -319,6 +430,7 @@ class DiskBackend:
+     def _record_failure(
+         self, operation: str, event_idx: int, error: BaseException
+     ) -> None:
++        self._record_error(operation, self._classify_error(error))
+         failure = RuntimeError(
+             f"KV disk {operation} event {event_idx} failed: "
+             f"{type(error).__name__}: {error}"
+@@ -398,13 +510,20 @@ class DiskBackend:
+             try:
+                 if wait_event is not None:
+                     stream.wait_event(wait_event)
++                self._set_inflight("store", len(src_blocks))
++                started = time.monotonic()
+                 self._do_store(src_blocks, dst_blocks, stream)
++                self._record_transfer(
++                    "store", len(src_blocks), time.monotonic() - started
++                )
+                 event = torch.Event()
+                 event.record(stream)
+                 events_list.append((event_idx, event))
+             except BaseException as error:
+                 self._record_failure("store", event_idx, error)
+                 return
++            finally:
++                self._set_inflight("store", 0)
+ 
+     def _writev_slot(self, buf_slot: int, disk_slot: int) -> None:
+         file_offset = disk_slot * self._disk_slot_bytes
+@@ -446,13 +565,20 @@ class DiskBackend:
+             try:
+                 if wait_event is not None:
+                     stream.wait_event(wait_event)
++                self._set_inflight("load", len(src_blocks))
++                started = time.monotonic()
+                 self._do_load(src_blocks, dst_blocks, stream)
++                self._record_transfer(
++                    "load", len(src_blocks), time.monotonic() - started
++                )
+                 event = torch.Event()
+                 event.record(stream)
+                 events_list.append((event_idx, event))
+             except BaseException as error:
+                 self._record_failure("load", event_idx, error)
+                 return
++            finally:
++                self._set_inflight("load", 0)
+ 
+     def _do_store(
+         self,
+@@ -464,6 +590,8 @@ class DiskBackend:
+         assert self._store_params is not None
+         if self._manifest is not None:
+             self._manifest.invalidate(disk_slots)
++            with self._metrics_lock:
++                self._valid_slots.difference_update(disk_slots)
+         n = self._num_buffer_slots
+         # (DMA event, disk slot) of the block already staged in each buffer.
+         pending: list[tuple[torch.Event, int] | None] = [None] * n
+@@ -495,6 +623,8 @@ class DiskBackend:
+                     )
+                 checksums[slot] = checksum
+             self._manifest.commit(checksums)
++        with self._metrics_lock:
++            self._valid_slots.update(disk_slots)
+ 
+     def _do_load(
+         self,
+diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/manager.py
+index a484c101c..63b7a4ac8 100644
+--- a/vllm/v1/simple_kv_offload/manager.py
++++ b/vllm/v1/simple_kv_offload/manager.py
+@@ -30,6 +30,14 @@ from vllm.v1.simple_kv_offload.metadata import (
+     SimpleCPUOffloadMetadata,
+     SimpleCPUOffloadWorkerMetadata,
+ )
++from vllm.v1.simple_kv_offload.metrics import (
++    DISK_CAPACITY_BYTES,
++    DISK_CAPACITY_SLOTS,
++    DISK_COMMITTED_SLOTS,
++    DISK_EVICTIONS,
++    DISK_RESTORED_SLOTS,
++    SimpleCPUOffloadStats,
++)
+ from vllm.v1.simple_kv_offload.persistent_metadata import SchedulerSlotIndex
+ 
+ if TYPE_CHECKING:
+@@ -109,6 +117,11 @@ class SimpleCPUOffloadScheduler:
+         )
+         self.num_cpu_blocks = self.cpu_kv_cache_config.num_blocks
+         self.max_store_blocks_per_event = max_store_blocks_per_event
++        self._disk_mode = disk_capacity_bytes > 0
++        self._disk_capacity_bytes = disk_capacity_bytes
++        self._committed_slots: set[int] = set()
++        self._restored_slots = 0
++        self._interval_metrics = SimpleCPUOffloadStats()
+         # Find the full attention kv group for prefix cache matching.
+         self.fa_gidx = -1
+         for g_idx, g in enumerate(self.cpu_kv_cache_config.kv_cache_groups):
+@@ -257,6 +270,31 @@ class SimpleCPUOffloadScheduler:
+             self.cpu_block_pool.free_blocks(restored_blocks)
+         if mappings:
+             logger.info("Restored %d committed persistent KV slots", len(mappings))
++        self._committed_slots.update(mappings)
++        self._restored_slots = len(mappings)
++
++    def _allocate_offload_blocks(self, num_blocks: int) -> list["KVCacheBlock"]:
++        blocks = self.cpu_block_pool.get_new_blocks(num_blocks)
++        block_ids = [block.block_id for block in blocks]
++        evicted = self._committed_slots.intersection(block_ids)
++        if evicted:
++            self._committed_slots.difference_update(evicted)
++            self._interval_metrics.increase_counter(DISK_EVICTIONS, len(evicted))
++        if self._persistent_index is not None:
++            self._persistent_index.invalidate(block_ids)
++        return blocks
++
++    def get_kv_connector_stats(self) -> SimpleCPUOffloadStats | None:
++        if not self._disk_mode:
++            return None
++        stats = self._interval_metrics
++        self._interval_metrics = SimpleCPUOffloadStats()
++        scope = ("scheduler",)
++        stats.set_gauge(DISK_CAPACITY_BYTES, self._disk_capacity_bytes, scope)
++        stats.set_gauge(DISK_CAPACITY_SLOTS, self.num_cpu_blocks, scope)
++        stats.set_gauge(DISK_COMMITTED_SLOTS, len(self._committed_slots), scope)
++        stats.set_gauge(DISK_RESTORED_SLOTS, self._restored_slots, scope)
++        return stats
+ 
+     @staticmethod
+     def _derive_cpu_config(
+@@ -624,10 +662,8 @@ class SimpleCPUOffloadScheduler:
+ 
+         # Batch-allocate CPU blocks and stamp hashes.
+         if gpu_ids:
+-            cpu_blocks = cpu_pool.get_new_blocks(len(gpu_ids))
++            cpu_blocks = self._allocate_offload_blocks(len(gpu_ids))
+             cpu_ids = [blk.block_id for blk in cpu_blocks]
+-            if self._persistent_index is not None:
+-                self._persistent_index.invalidate(cpu_ids)
+             for cpu_blk, bhash in zip(cpu_blocks, block_hashes):  # type: ignore[assignment]
+                 cpu_blk._block_hash = bhash  # type: ignore[assignment]
+             # Touch GPU blocks to prevent eviction during async copy.
+@@ -760,10 +796,8 @@ class SimpleCPUOffloadScheduler:
+             # --- Phase 2: Batch allocate CPU blocks and stamp hashes ---
+             n_to_alloc = len(gpu_block_ids)
+             if n_to_alloc > 0:
+-                cpu_blocks_alloc = cpu_block_pool.get_new_blocks(n_to_alloc)
++                cpu_blocks_alloc = self._allocate_offload_blocks(n_to_alloc)
+                 cpu_block_ids = [blk.block_id for blk in cpu_blocks_alloc]
+-                if self._persistent_index is not None:
+-                    self._persistent_index.invalidate(cpu_block_ids)
+                 for cpu_blk, bhash in zip(cpu_blocks_alloc, block_hashes_to_store):
+                     cpu_blk._block_hash = bhash  # type: ignore[assignment]
+             else:
+@@ -878,6 +912,8 @@ class SimpleCPUOffloadScheduler:
+             assert bhash is not None
+             self.cpu_block_pool.cached_block_hash_to_block.insert(bhash, cpu_block)
+ 
++        self._committed_slots.update(cpu_block_ids)
++
+         # Free CPU and GPU blocks' ref counts to turn them into prefix cache
+         self.cpu_block_pool.free_blocks(cpu_blocks)
+         assert self._gpu_block_pool is not None
+@@ -1053,4 +1089,7 @@ class SimpleCPUOffloadScheduler:
+                 return False
+             self._persistent_index.clear()
+ 
+-        return self.cpu_block_pool.reset_prefix_cache()
++        result = self.cpu_block_pool.reset_prefix_cache()
++        if result:
++            self._committed_slots.clear()
++        return result
+diff --git a/vllm/v1/simple_kv_offload/metrics.py b/vllm/v1/simple_kv_offload/metrics.py
+new file mode 100644
+index 000000000..814c7f826
+--- /dev/null
++++ b/vllm/v1/simple_kv_offload/metrics.py
+@@ -0,0 +1,276 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Prometheus metrics for the bounded local-NVMe offload backend."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Any
++
++from vllm.config import VllmConfig
++from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
++    KVConnectorPromMetrics,
++    KVConnectorStats,
++    PromMetric,
++    PromMetricT,
++)
++
++DISK_CAPACITY_BYTES = "vllm:kv_offload_disk_capacity_bytes"
++DISK_CAPACITY_SLOTS = "vllm:kv_offload_disk_capacity_slots"
++DISK_COMMITTED_SLOTS = "vllm:kv_offload_disk_committed_slots"
++DISK_RESTORED_SLOTS = "vllm:kv_offload_disk_restored_slots"
++DISK_STAGING_BYTES = "vllm:kv_offload_disk_staging_bytes"
++DISK_BUFFER_SLOTS = "vllm:kv_offload_disk_buffer_slots"
++DISK_QUEUE_DEPTH = "vllm:kv_offload_disk_queue_depth"
++DISK_INFLIGHT_BLOCKS = "vllm:kv_offload_disk_inflight_blocks"
++DISK_TRANSFER_BYTES = "vllm:kv_offload_disk_transfer_bytes"
++DISK_TRANSFER_BLOCKS = "vllm:kv_offload_disk_transfer_blocks"
++DISK_TRANSFER_OPERATIONS = "vllm:kv_offload_disk_transfer_operations"
++DISK_TRANSFER_DURATION = "vllm:kv_offload_disk_transfer_duration_seconds"
++DISK_EVICTIONS = "vllm:kv_offload_disk_evictions"
++DISK_ERRORS = "vllm:kv_offload_disk_errors"
++
++_COUNTERS = "counters"
++_GAUGES = "gauges"
++_HISTOGRAMS = "histograms"
++
++
++@dataclass(frozen=True)
++class _MetricDefinition:
++    kind: str
++    documentation: str
++    labelnames: tuple[str, ...] = ()
++    buckets: tuple[float, ...] | None = None
++
++
++_METRIC_DEFINITIONS = {
++    DISK_CAPACITY_BYTES: _MetricDefinition(
++        _GAUGES,
++        "Configured or allocated NVMe KV cache capacity, in bytes.",
++        ("scope",),
++    ),
++    DISK_CAPACITY_SLOTS: _MetricDefinition(
++        _GAUGES,
++        "Number of fixed-size NVMe KV cache slots.",
++        ("scope",),
++    ),
++    DISK_COMMITTED_SLOTS: _MetricDefinition(
++        _GAUGES,
++        "Number of committed or rank-valid NVMe KV cache slots.",
++        ("scope",),
++    ),
++    DISK_RESTORED_SLOTS: _MetricDefinition(
++        _GAUGES,
++        "Number of persistent NVMe KV slots restored at process startup.",
++        ("scope",),
++    ),
++    DISK_STAGING_BYTES: _MetricDefinition(
++        _GAUGES,
++        "Pinned host staging capacity for one transfer direction, in bytes.",
++        ("rank", "operation"),
++    ),
++    DISK_BUFFER_SLOTS: _MetricDefinition(
++        _GAUGES,
++        "Number of reusable pinned staging rows for one transfer direction.",
++        ("rank", "operation"),
++    ),
++    DISK_QUEUE_DEPTH: _MetricDefinition(
++        _GAUGES,
++        "Current number of queued NVMe KV transfer events.",
++        ("rank", "operation"),
++    ),
++    DISK_INFLIGHT_BLOCKS: _MetricDefinition(
++        _GAUGES,
++        "Current number of NVMe KV blocks in the executing transfer event.",
++        ("rank", "operation"),
++    ),
++    DISK_TRANSFER_BYTES: _MetricDefinition(
++        _COUNTERS,
++        "Total aligned bytes successfully transferred through the NVMe backend.",
++        ("rank", "operation"),
++    ),
++    DISK_TRANSFER_BLOCKS: _MetricDefinition(
++        _COUNTERS,
++        "Total fixed-size blocks successfully transferred through NVMe.",
++        ("rank", "operation"),
++    ),
++    DISK_TRANSFER_OPERATIONS: _MetricDefinition(
++        _COUNTERS,
++        "Total successful NVMe KV transfer events.",
++        ("rank", "operation"),
++    ),
++    DISK_TRANSFER_DURATION: _MetricDefinition(
++        _HISTOGRAMS,
++        "NVMe KV backend event time through final CUDA DMA submission.",
++        ("rank", "operation"),
++        (
++            0.001,
++            0.005,
++            0.01,
++            0.025,
++            0.05,
++            0.1,
++            0.25,
++            0.5,
++            1.0,
++            2.5,
++            5.0,
++            10.0,
++            30.0,
++            60.0,
++            120.0,
++            300.0,
++        ),
++    ),
++    DISK_EVICTIONS: _MetricDefinition(
++        _COUNTERS,
++        "Total committed NVMe KV slots evicted for reuse.",
++    ),
++    DISK_ERRORS: _MetricDefinition(
++        _COUNTERS,
++        "Total NVMe KV backend errors by bounded reason.",
++        ("rank", "operation", "reason"),
++    ),
++}
++
++
++@dataclass
++class SimpleCPUOffloadStats(KVConnectorStats):
++    """Serializable interval counters, gauges, and histogram samples."""
++
++    def __post_init__(self) -> None:
++        if not self.data:
++            self.reset()
++
++    def reset(self) -> None:
++        self.data = {
++            _COUNTERS: {},
++            _GAUGES: {},
++            _HISTOGRAMS: {},
++        }
++
++    def increase_counter(
++        self,
++        name: str,
++        value: int | float,
++        labelvalues: tuple[str, ...] = (),
++    ) -> None:
++        values = self.data[_COUNTERS].setdefault(name, {})
++        values[labelvalues] = values.get(labelvalues, 0) + value
++
++    def set_gauge(
++        self,
++        name: str,
++        value: int | float,
++        labelvalues: tuple[str, ...] = (),
++    ) -> None:
++        self.data[_GAUGES].setdefault(name, {})[labelvalues] = value
++
++    def observe_histogram(
++        self,
++        name: str,
++        value: int | float,
++        labelvalues: tuple[str, ...] = (),
++    ) -> None:
++        self.data[_HISTOGRAMS].setdefault(name, {}).setdefault(labelvalues, []).append(
++            value
++        )
++
++    def aggregate(self, other: KVConnectorStats) -> KVConnectorStats:
++        assert isinstance(other, SimpleCPUOffloadStats)
++        for name, labeled_values in other.data[_COUNTERS].items():
++            for labelvalues, value in labeled_values.items():
++                self.increase_counter(name, value, labelvalues)
++        for name, labeled_values in other.data[_GAUGES].items():
++            for labelvalues, value in labeled_values.items():
++                self.set_gauge(name, value, labelvalues)
++        for name, labeled_values in other.data[_HISTOGRAMS].items():
++            for labelvalues, samples in labeled_values.items():
++                for sample in samples:
++                    self.observe_histogram(name, sample, labelvalues)
++        return self
++
++    def reduce(self) -> dict[str, int | float]:
++        reduced: dict[str, int | float] = {}
++        for kind in (_COUNTERS, _GAUGES):
++            for name, labeled_values in self.data[kind].items():
++                for labelvalues, value in labeled_values.items():
++                    key = f"{name}:{labelvalues}" if labelvalues else name
++                    reduced[key] = value
++        for name, labeled_values in self.data[_HISTOGRAMS].items():
++            for labelvalues, samples in labeled_values.items():
++                key = f"{name}:{labelvalues}" if labelvalues else name
++                reduced[f"{key}_count"] = len(samples)
++                reduced[f"{key}_sum"] = sum(samples)
++        return reduced
++
++    def is_empty(self) -> bool:
++        return not any(self.data[kind] for kind in self.data)
++
++
++class SimpleCPUOffloadPromMetrics(KVConnectorPromMetrics):
++    """Registers and observes bounded local-NVMe connector metrics."""
++
++    def __init__(
++        self,
++        vllm_config: VllmConfig,
++        metric_types: dict[type[PromMetric], type[PromMetricT]],
++        labelnames: list[str],
++        per_engine_labelvalues: dict[int, list[object]],
++    ) -> None:
++        super().__init__(vllm_config, metric_types, labelnames, per_engine_labelvalues)
++        self.metric_definitions: dict[str, PromMetricT] = {}
++        self.metrics: dict[tuple[int, str, tuple[str, ...]], PromMetricT] = {}
++        metric_classes = {
++            _COUNTERS: self._counter_cls,
++            _GAUGES: self._gauge_cls,
++            _HISTOGRAMS: self._histogram_cls,
++        }
++        for name, definition in _METRIC_DEFINITIONS.items():
++            kwargs: dict[str, Any] = {
++                "name": name,
++                "documentation": definition.documentation,
++                "labelnames": labelnames + list(definition.labelnames),
++            }
++            if definition.buckets is not None:
++                kwargs["buckets"] = definition.buckets
++            self.metric_definitions[name] = metric_classes[definition.kind](**kwargs)
++
++    def _metric(
++        self,
++        engine_idx: int,
++        name: str,
++        labelvalues: tuple[str, ...],
++    ) -> PromMetricT:
++        definition = _METRIC_DEFINITIONS[name]
++        if len(labelvalues) != len(definition.labelnames):
++            raise AssertionError(
++                f"Metric {name} expects {len(definition.labelnames)} labels, "
++                f"got {len(labelvalues)}"
++            )
++        key = (engine_idx, name, labelvalues)
++        metric = self.metrics.get(key)
++        if metric is None:
++            engine_labels = self.per_engine_labelvalues[engine_idx]
++            metric = self.metric_definitions[name].labels(
++                *(engine_labels + list(labelvalues))
++            )
++            self.metrics[key] = metric
++        return metric
++
++    def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0) -> None:
++        stats = SimpleCPUOffloadStats(data=transfer_stats_data)
++        for name, labeled_values in stats.data[_COUNTERS].items():
++            assert _METRIC_DEFINITIONS[name].kind == _COUNTERS
++            for labelvalues, value in labeled_values.items():
++                self._metric(engine_idx, name, labelvalues).inc(value)
++        for name, labeled_values in stats.data[_GAUGES].items():
++            assert _METRIC_DEFINITIONS[name].kind == _GAUGES
++            for labelvalues, value in labeled_values.items():
++                self._metric(engine_idx, name, labelvalues).set(value)
++        for name, labeled_values in stats.data[_HISTOGRAMS].items():
++            assert _METRIC_DEFINITIONS[name].kind == _HISTOGRAMS
++            for labelvalues, samples in labeled_values.items():
++                metric = self._metric(engine_idx, name, labelvalues)
++                for sample in samples:
++                    metric.observe(sample)
+diff --git a/vllm/v1/simple_kv_offload/worker.py b/vllm/v1/simple_kv_offload/worker.py
+index 34d7a3b5b..9db2b416d 100644
+--- a/vllm/v1/simple_kv_offload/worker.py
++++ b/vllm/v1/simple_kv_offload/worker.py
+@@ -20,6 +20,7 @@ from vllm.v1.simple_kv_offload.metadata import (
+     SimpleCPUOffloadMetadata,
+     SimpleCPUOffloadWorkerMetadata,
+ )
++from vllm.v1.simple_kv_offload.metrics import SimpleCPUOffloadStats
+ 
+ if TYPE_CHECKING:
+     from vllm.v1.kv_cache_interface import KVCacheConfig
+@@ -240,12 +241,18 @@ class SimpleCPUOffloadWorker:
+             self.disk_enqueue_timeout_s,
+             self.disk_persistence,
+             persistent_identity,
++            rank,
+         )
+ 
+     def shutdown(self) -> None:
+         if self._backend is not None:
+             self._backend.shutdown()
+ 
++    def get_kv_connector_stats(self) -> SimpleCPUOffloadStats | None:
++        if isinstance(self._backend, DiskBackend):
++            return self._backend.get_stats()
++        return None
++
+     def _init_cpu_mode(
+         self,
+         unique_gpu_caches: dict[str, torch.Tensor],
+-- 
+2.43.0
+

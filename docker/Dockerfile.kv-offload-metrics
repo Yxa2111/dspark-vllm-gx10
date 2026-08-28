@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: MIT
+ARG VLLM_BASE=dspark-vllm-gx10:kv-offload-persistent-lru-step31
+FROM ${VLLM_BASE}
+
+LABEL org.opencontainers.image.source="https://github.com/Yxa2111/dspark-vllm-gx10"
+LABEL org.opencontainers.image.description="Prometheus telemetry for persistent packed-NVMe KV offload"
+
+COPY docker/packed-nvme-metrics.patch /tmp/packed-nvme-metrics.patch
+
+RUN cd /usr/local/lib/python3.12/dist-packages && \
+    patch --batch --forward --dry-run -p1 \
+      < /tmp/packed-nvme-metrics.patch && \
+    patch --batch --forward -p1 \
+      < /tmp/packed-nvme-metrics.patch && \
+    python3 -m py_compile \
+      vllm/v1/simple_kv_offload/disk_backend.py \
+      vllm/v1/simple_kv_offload/manager.py \
+      vllm/v1/simple_kv_offload/metrics.py \
+      vllm/v1/simple_kv_offload/worker.py \
+      vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py && \
+    rm -f /tmp/packed-nvme-metrics.patch
