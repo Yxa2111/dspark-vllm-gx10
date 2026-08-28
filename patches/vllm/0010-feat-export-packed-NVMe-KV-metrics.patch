@@ -1,4 +1,4 @@
-From ee85d39f863e7f8b522d05395d406e1c8b1fdb44 Mon Sep 17 00:00:00 2001
+From e799b50d637beab8952c8c8ac5150bc714ff70df Mon Sep 17 00:00:00 2001
 From: Yxa2111 <yxa2013@outlook.com>
 Date: Fri, 28 Aug 2026 22:09:38 +0800
 Subject: [PATCH] feat: export packed NVMe KV metrics
@@ -17,7 +17,7 @@ Subject: [PATCH] feat: export packed NVMe KV metrics
 
 diff --git a/tests/v1/simple_kv_offload/test_metrics.py b/tests/v1/simple_kv_offload/test_metrics.py
 new file mode 100644
-index 000000000..fa0b21521
+index 000000000..5dba8336c
 --- /dev/null
 +++ b/tests/v1/simple_kv_offload/test_metrics.py
 @@ -0,0 +1,126 @@
@@ -97,7 +97,7 @@ index 000000000..fa0b21521
 +
 +def test_prometheus_observer_routes_bounded_labels() -> None:
 +    metrics = SimpleCPUOffloadPromMetrics(
-+        vllm_config=SimpleNamespace(),  # type: ignore[arg-type]
++        vllm_config=SimpleNamespace(kv_transfer_config=None),  # type: ignore[arg-type]
 +        metric_types={
 +            Counter: _FakeMetric,
 +            Gauge: _FakeMetric,
